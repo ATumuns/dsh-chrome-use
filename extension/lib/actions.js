@@ -1235,6 +1235,8 @@ export async function dispatch(method, params) {
     case 'session.detach':
       await detachAll()
       return { detached: true }
+    case 'session.reload':
+      return reloadExtension()
     case 'page.focus':
       return focusPage(params)
     default:
@@ -1242,8 +1244,27 @@ export async function dispatch(method, params) {
   }
 }
 
-async function focusPage(params = {}) {
-  const tab = await resolveTab(params)
+/**
+ * Reload this extension so a freshly edited worker takes effect.
+ *
+ * The answer is written to the socket before the worker dies — the delay is
+ * what makes that true — but the connection still drops, so the caller has to
+ * wait for the new client to appear rather than for a second reply.
+ * @returns {{ reloading: true }}
+ */
+function reloadExtension() {
+  setTimeout(() => {
+    try {
+      chrome.runtime.reload()
+    } catch {
+      // Nothing to report: the socket is about to close either way, and the
+      // caller learns the outcome from whether a new client shows up.
+    }
+  }, 300)
+  return { reloading: true }
+}
+
+async function focusPage(params = {}) {  const tab = await resolveTab(params)
   const rect = await evaluate(
     tab.id,
     `(() => {

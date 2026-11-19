@@ -25,6 +25,13 @@ const USER_STOPPED_KEY = 'dsh-chrome-use/userStopped'
 const PING_INTERVAL_MS = 20_000
 const SILENCE_LIMIT_MS = 75_000
 const MAX_BACKOFF_MS = 30_000
+/**
+ * Bumped whenever this worker's behaviour changes, because the manifest version
+ * does not move during development. `chrome_use_status` prints it, which is the
+ * only reliable way to tell a freshly reloaded extension from one still running
+ * yesterday's code — an automatic reconnect looks identical to a reload.
+ */
+const BUILD = '2026-11-19.2'
 
 /** @type {WebSocket | null} */
 let socket = null
@@ -83,7 +90,13 @@ function setStatus(state, detail) {
 function browserInfo() {
   const ua = navigator.userAgent
   const match = /(Chrome|Chromium|Edg)\/(\d+)/.exec(ua)
-  return { userAgent: ua, product: match ? match[1] : 'Chromium', major: match ? Number(match[2]) : null }
+  let version = null
+  try {
+    version = chrome.runtime.getManifest().version ?? null
+  } catch {
+    // A worker revived without the extension APIs still reports the UA.
+  }
+  return { userAgent: ua, product: match ? match[1] : 'Chromium', major: match ? Number(match[2]) : null, version, build: BUILD }
 }
 
 function endpointFor(settings) {
