@@ -1,0 +1,36 @@
+{
+  "name": "dsh-chrome-use",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH-Chrome-Use: let DeepSeek Harness drive your real Chromium browser (Chrome/Edge) through a paired MV3 extension and the Chrome DevTools Protocol.",
+  "main": "lib/index.js",
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+    }
+  },
+  "files": [
+    "lib",
+    "locale",
+    "extension",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH Chrome Use",
+    "description": "让 DSH 直接驱动你自己的 Chrome：读页面、点按钮、填表单、抓截图、看控制台与网络。配套浏览器扩展，走 CDP 全能力，不需要原生消息宿主。"
+  }
+}

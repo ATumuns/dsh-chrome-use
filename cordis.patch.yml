@@ -1,0 +1,7 @@
+# dsh-chrome-use bundle patch.
+# The row name resolves from the profile's own node_modules, where
+# `plugin_manager install_bundle <path>` installed this package.
+- insert:
+    - id: chrome-use
+      name: dsh-chrome-use
+      config: {}

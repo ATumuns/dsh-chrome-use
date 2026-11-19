@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DSH-Chrome-Use · 设置</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #101418;
+        --muted: #5b6670;
+        --line: #d8dee4;
+        --accent: #1f6feb;
+        --ok: #1a7f37;
+        --bad: #cf222e;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0d1117;
+          --fg: #e6edf3;
+          --muted: #9198a1;
+          --line: #30363d;
+          --accent: #4493f8;
+          --ok: #3fb950;
+          --bad: #f85149;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+      }
+      main { max-width: 720px; margin: 0 auto; padding: 40px 24px 80px; }
+      h1 { margin: 0 0 4px; font-size: 21px; }
+      .lede { margin: 0 0 28px; color: var(--muted); font-size: 13.5px; }
+      section {
+        border: 1px solid var(--line); border-radius: 10px;
+        padding: 18px 20px; margin-bottom: 16px;
+      }
+      h2 { margin: 0 0 12px; font-size: 14px; letter-spacing: 0.02em; color: var(--muted); text-transform: uppercase; }
+      label { display: block; margin-bottom: 14px; }
+      .label { display: block; margin-bottom: 5px; font-size: 12.5px; color: var(--muted); }
+      input[type='text'], input[type='password'], input[type='number'], select {
+        width: 100%; padding: 8px 10px;
+        border: 1px solid var(--line); border-radius: 7px;
+        background: var(--bg); color: var(--fg);
+        font: 13px/1.4 ui-monospace, 'Cascadia Code', Consolas, monospace;
+      }
+      input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 1px; }
+      .note { margin: 6px 0 0; color: var(--muted); font-size: 11.5px; }
+      .inline { display: flex; gap: 10px; align-items: center; }
+      .inline input[type='checkbox'] { width: 16px; height: 16px; }
+      .actions { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
+      button {
+        padding: 8px 16px; cursor: pointer;
+        border: 1px solid var(--line); border-radius: 7px;
+        background: transparent; color: var(--fg); font-size: 13px;
+      }
+      button:hover { border-color: var(--accent); color: var(--accent); }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+      button.primary:hover { filter: brightness(1.08); color: #fff; }
+      #status { font-size: 12.5px; color: var(--muted); }
+      #status.ok { color: var(--ok); }
+      #status.bad { color: var(--bad); }
+      ol { margin: 0; padding-left: 20px; }
+      ol li { margin-bottom: 7px; }
+      code { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; font-size: 12px; background: color-mix(in srgb, var(--fg) 7%, transparent); padding: 1px 5px; border-radius: 4px; }
+      .kv { display: grid; grid-template-columns: 120px 1fr; gap: 6px 12px; font-size: 12.5px; }
+      .kv dt { color: var(--muted); }
+      .kv dd { margin: 0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>DSH-Chrome-Use</h1>
+      <p class="lede">
+        这个扩展到 DeepSeek Harness 的本地桥接拨出，把当前浏览器交给 DSH 操作。
+        走 CDP（<code>chrome.debugger</code>），因此点击、输入是可信事件，页面无需注入常驻脚本。
+      </p>
+
+      <section>
+        <h2>配对</h2>
+        <label>
+          <span class="label">桥接地址</span>
+          <input id="bridgeUrl" type="text" spellcheck="false" />
+          <p class="note">DSH 默认 <code>ws://127.0.0.1:57232/dsh-chrome-use/bridge</code>；端口随 DSH 实例变化，以 <code>chrome_use_status</code> 输出的为准。</p>
+        </label>
+        <label>
+          <span class="label">配对令牌</span>
+          <div class="inline">
+            <input id="token" type="password" spellcheck="false" autocomplete="off" />
+            <button id="reveal" type="button">显示</button>
+          </div>
+          <p class="note">在 DSH 里运行工具 <code>chrome_use_status</code>（或 <code>chrome_use_pair</code>），复制返回的 token 粘到这里。</p>
+        </label>
+        <label>
+          <span class="label">标识（可选）</span>
+          <input id="agentLabel" type="text" spellcheck="false" />
+          <p class="note">多台浏览器或多人共用时用来区分，会出现在 DSH 的工具输出里。</p>
+        </label>
+        <label class="inline" style="margin-top: 4px">
+          <input id="autoConnect" type="checkbox" />
+          <span>浏览器启动时自动连接</span>
+        </label>
+        <div class="actions">
+          <button id="save" class="primary" type="button">保存并重连</button>
+          <span id="status"></span>
+        </div>
+      </section>
+
+      <section>
+        <h2>使用步骤</h2>
+        <ol>
+          <li>在 DSH 里确认扩展已配对：调用 <code>chrome_use_status</code>，<code>connected: true</code> 即通。</li>
+          <li>让 DSH 打开页面：<code>chrome_use_open_tab</code> 或直接 <code>chrome_use_navigate</code>。</li>
+          <li>取快照看页面结构：<code>chrome_use_snapshot</code> 返回可交互元素的 <code>ref</code>（如 <code>e12</code>）与文本大纲。</li>
+          <li>用 <code>ref</code> 操作：<code>chrome_use_click</code> / <code>chrome_use_type</code> / <code>chrome_use_press</code>，无需坐标。</li>
+          <li>排错时看 <code>chrome_use_console</code> 与 <code>chrome_use_network</code>，截图用 <code>chrome_use_screenshot</code>。</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>运行状态</h2>
+        <dl class="kv">
+          <dt>连接</dt><dd id="state">—</dd>
+          <dt>浏览器</dt><dd id="browser">—</dd>
+          <dt>CDP 会话</dt><dd id="tabs">—</dd>
+        </dl>
+        <div class="actions">
+          <button id="connect" type="button">立即连接</button>
+          <button id="disconnect" type="button">断开</button>
+          <button id="refresh" type="button">刷新</button>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

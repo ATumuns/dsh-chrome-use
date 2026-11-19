@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH Chrome Use",
+    "description": "Let DSH drive your own Chrome: read pages, click, type, capture screenshots, inspect console and network. Ships with a browser extension that speaks CDP — no native-messaging host required."
+  }
+}
