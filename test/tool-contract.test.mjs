@@ -1,0 +1,129 @@
+/**
+ * Contract test: every bridge method the host tools can send must have a case
+ * in the extension's dispatch table, and every tool definition must survive the
+ * harness schema gate.
+ *
+ * The two halves of this project live in separate runtimes — the host bundle in
+ * Node and the extension in a service worker — so nothing at load time catches
+ * a method name that only one side knows. This test is that check.
+ *
+ * Run: node test/tool-contract.test.mjs
+ */
+
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const root = join(here, '..')
+
+let failures = 0
+let checks = 0
+
+function check(label, condition, detail) {
+  checks += 1
+  if (condition) {
+    process.stdout.write(`  ok   ${label}\n`)
+    return
+  }
+  failures += 1
+  process.stdout.write(`  FAIL ${label}${detail ? `\n       ${detail}` : ''}\n`)
+}
+
+/** Method names the host side sends, read from the source the tools actually use. */
+async function hostMethods() {
+  const source = await readFile(join(root, 'lib', 'tools.js'), 'utf8')
+  const found = new Set()
+  for (const match of source.matchAll(/'((?:tabs|page|browser|cookies|session)\.[a-zA-Z]+)'/g)) found.add(match[1])
+  // Two methods carry no namespace: the status handshake and the storage family,
+  // which the extension routes by its own `area` parameter.
+  for (const bare of ['status', 'storage']) {
+    if (source.includes(`'${bare}'`)) found.add(bare)
+  }
+  return found
+}
+
+/** Method names the extension answers, read from its dispatch switch. */
+async function extensionMethods() {
+  const source = await readFile(join(root, 'extension', 'lib', 'actions.js'), 'utf8')
+  const found = new Set()
+  for (const match of source.matchAll(/case '([a-zA-Z.]+)':/g)) found.add(match[1])
+  return found
+}
+
+process.stdout.write('tool contract\n')
+
+const host = await hostMethods()
+const extension = await extensionMethods()
+
+check('host sends a non-empty method set', host.size > 0, `got ${host.size}`)
+check('extension answers a non-empty method set', extension.size > 0, `got ${extension.size}`)
+
+const unanswered = [...host].filter((name) => !extension.has(name)).sort()
+check(
+  'every host method has an extension case',
+  unanswered.length === 0,
+  `unanswered: ${unanswered.join(', ')}`,
+)
+
+const unused = [...extension].filter((name) => !host.has(name) && name !== 'session.detach').sort()
+check('no extension case is unreachable from a tool', unused.length === 0, `unused: ${unused.join(', ')}`)
+
+// --- tool definitions -------------------------------------------------------
+
+const { createTools } = await import('../lib/tools.js')
+
+const stubBridge = {
+  list: () => [],
+  require: () => {
+    throw new Error('no browser connected')
+  },
+  describe: () => ({ clients: [] }),
+}
+const ctx = { get: () => undefined }
+
+let definitions
+try {
+  definitions = createTools({
+    bridge: stubBridge,
+    token: () => 'test-token',
+    rotateToken: () => 'test-token',
+    endpoint: 'ws://127.0.0.1:0/dsh-chrome-use/bridge',
+    ctx,
+    log: { info() {}, warn() {}, error() {} },
+  })
+} catch (error) {
+  check('createTools() returns definitions', false, String(error))
+  definitions = []
+}
+
+check('createTools() returns seven tools', definitions.length === 7, `got ${definitions.length}`)
+
+const expectedNames = [
+  'chrome_use_status',
+  'chrome_use_tabs',
+  'chrome_use_navigate',
+  'chrome_use_snapshot',
+  'chrome_use_interact',
+  'chrome_use_read',
+  'chrome_use_capture',
+]
+check(
+  'tool names and order are stable',
+  definitions.map((tool) => tool.name).join(',') === expectedNames.join(','),
+  definitions.map((tool) => tool.name).join(','),
+)
+
+for (const tool of definitions) {
+  check(`${tool.name} has a description`, typeof tool.description === 'string' && tool.description.length > 40)
+  check(`${tool.name} declares an object parameter schema`, tool.parameters?.type === 'object')
+  check(`${tool.name} renders text`, typeof tool.output?.render === 'function')
+  check(`${tool.name} executes`, typeof tool.execute === 'function')
+}
+
+// The harness rejects tool names reserved by the PTC presentation transport.
+check('no tool claims the reserved name run_code', !definitions.some((tool) => tool.name === 'run_code'))
+
+process.stdout.write(`\n${checks - failures}/${checks} checks passed\n`)
+if (failures > 0) process.exitCode = 1
+else process.stdout.write('tool-contract: all checks passed\n')

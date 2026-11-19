@@ -7,7 +7,7 @@
  *
  * @module dsh-chrome-use/extension/lib/actions
  */
-import { sessionFor, existingSession, attachedTabs, detachAll, forgetTab } from './cdp.js'
+import { sessionFor, existingSession, attachedTabs, detachAll, forgetTab, ABANDONED } from './cdp.js'
 import {
   snapshotScript,
   focusScript,
@@ -49,18 +49,30 @@ export async function resolveTab(params = {}) {
 
 async function evaluate(tabId, expression, { awaitPromise = false, timeoutMs } = {}) {
   const session = await sessionFor(tabId)
-  const result = await session.send('Runtime.evaluate', {
-    expression,
-    returnByValue: true,
-    awaitPromise,
-    userGesture: true,
-    ...(timeoutMs ? { timeout: timeoutMs } : {}),
-  })
+  const result = await session.send(
+    'Runtime.evaluate',
+    {
+      expression,
+      returnByValue: true,
+      awaitPromise,
+      userGesture: true,
+      ...(timeoutMs ? { timeout: timeoutMs } : {}),
+    },
+    { releaseOnDialog: true },
+  )
+  if (result === ABANDONED) throw dialogOpenedError(session)
   if (result?.exceptionDetails) {
     const detail = result.exceptionDetails
     throw new Error(detail.exception?.description ?? detail.text ?? 'page evaluation failed')
   }
   return result?.result?.value
+}
+
+/** Build the error for a command that could not return because a dialog blocked the page. */
+function dialogOpenedError(session) {
+  return new Error(
+    `${session.dialogMessage()}. Answer it with chrome_use_interact action dialog, then continue`,
+  )
 }
 
 function formatRect(rect) {
@@ -171,6 +183,7 @@ export async function snapshot(params = {}) {
       selector: params.selector ?? null,
       interactiveOnly: params.interactiveOnly === true,
       maxText: params.maxText ?? 160,
+      frames: params.frames !== false,
     }),
   )
   if (!value?.ok) throw new Error(value?.error ?? 'snapshot failed')
@@ -180,6 +193,7 @@ export async function snapshot(params = {}) {
     title: value.title,
     readyState: value.readyState,
     nodesVisited: value.nodesVisited,
+    framesWalked: value.framesWalked,
     truncated: value.truncated,
     refCount: value.refs.length,
     outline: value.outline,
@@ -203,17 +217,38 @@ export async function click(params = {}) {
   const button = params.button === 'right' ? 'right' : 'left'
   for (let index = 1; index <= clicks; index += 1) {
     for (const type of ['mousePressed', 'mouseReleased']) {
-      await session.send('Input.dispatchMouseEvent', {
-        type,
-        x: rect.x,
-        y: rect.y,
-        button,
-        clickCount: index,
-        buttons: type === 'mousePressed' ? 1 : 0,
-      })
+      const outcome = await session.send(
+        'Input.dispatchMouseEvent',
+        {
+          type,
+          x: rect.x,
+          y: rect.y,
+          button,
+          clickCount: index,
+          buttons: type === 'mousePressed' ? 1 : 0,
+        },
+        { releaseOnDialog: true },
+      )
+      if (outcome === ABANDONED) return dialogResult(tab.id, session, target.ref ?? target.selector)
     }
   }
   return { tabId: tab.id, clicked: target.ref ?? target.selector, rect: formatRect(rect) }
+}
+
+/**
+ * Describe a click/keys action whose page opened a dialog.
+ *
+ * The action did happen; it is only the acknowledgement that is missing, so this
+ * reports success plus the dialog instead of an error the model would retry.
+ */
+function dialogResult(tabId, session, target) {
+  return {
+    tabId,
+    target,
+    dialogOpened: true,
+    dialog: session.dialog,
+    hint: 'answer with chrome_use_interact action dialog, accept true or false',
+  }
 }
 
 export async function hover(params = {}) {
@@ -252,7 +287,10 @@ export async function press(params = {}) {
   }
   const session = await sessionFor(tab.id)
   const sequence = sequenceFor(params.key)
-  for (const event of sequence) await session.send('Input.dispatchKeyEvent', event)
+  for (const event of sequence) {
+    const outcome = await session.send('Input.dispatchKeyEvent', event, { releaseOnDialog: true })
+    if (outcome === ABANDONED) return dialogResult(tab.id, session, params.key)
+  }
   return { tabId: tab.id, key: params.key }
 }
 
@@ -368,6 +406,128 @@ export async function waitFor(params = {}) {
   )
   if (!value?.matched) throw new Error(`timed out after ${params.timeoutMs ?? 10000}ms waiting for ${params.kind} ${JSON.stringify(params.value ?? '')}`)
   return { tabId: tab.id, matched: true, waitedMs: value.waitedMs }
+}
+
+/**
+ * Report the JavaScript dialog that is currently blocking the page.
+ *
+ * A dialog blocks the renderer, so every later CDP call on that tab hangs until
+ * it is dismissed. This gives the model a way to find out before it tries.
+ */
+export async function pendingDialog(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  return { tabId: tab.id, dialog: session.dialog ?? null }
+}
+
+/**
+ * Accept or dismiss the dialog blocking the page.
+ *
+ * The dialog is sent even when no opening event was recorded: a dialog that was
+ * already up before this extension attached emits no event, and CDP answers it
+ * regardless. That is the recovery path for a tab stuck on a stale dialog.
+ */
+export async function handleDialog(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  const dialog = session.dialog
+  const accept = params.accept !== false
+  // Bypasses the per-tab queue on purpose: the command that opened this dialog
+  // still holds it until the dialog is answered.
+  try {
+    await session.sendImmediate('Page.handleJavaScriptDialog', {
+      accept,
+      ...(typeof params.promptText === 'string' ? { promptText: params.promptText } : {}),
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (/no dialog/i.test(message)) {
+      session.dialog = null
+      throw new Error(`no javascript dialog is open on tab ${tab.id}`)
+    }
+    throw error
+  }
+  session.dialog = null
+  return { tabId: tab.id, accepted: accept, type: dialog?.type ?? 'dialog', message: dialog?.message ?? '' }
+}
+
+/** Wait until in-flight network requests settle, so the next snapshot sees the result. */
+export async function waitForNetworkIdle(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  const result = await session.waitForNetworkIdle({
+    idleMs: params.idleMs ?? 500,
+    timeoutMs: params.timeoutMs ?? 15000,
+  })
+  if (!result.idle) {
+    throw new Error(`network was still busy after ${result.waitedMs}ms (${result.inflight ?? '?'} requests in flight)`)
+  }
+  return { tabId: tab.id, idle: true, waitedMs: result.waitedMs }
+}
+
+/**
+ * Set files on a file input.
+ *
+ * `DOM.setFileInputFiles` needs a real node id from the DOM domain, so the
+ * lookup runs through the document tree rather than a page expression. Elements
+ * inside a shadow root are not addressable that way; pass a selector that
+ * pierces, or upload through the visible input.
+ */
+export async function uploadFile(params = {}) {
+  const tab = await resolveTab(params)
+  const files = Array.isArray(params.files) ? params.files.map(String).filter(Boolean) : []
+  if (files.length === 0) throw new Error('upload needs at least one absolute path in files')
+  if (!params.ref && !params.selector) throw new Error('upload needs a ref (from snapshot) or a css selector')
+  const session = await sessionFor(tab.id)
+  const selector = params.selector ?? `[data-dsh-ref=${JSON.stringify(params.ref)}]`
+  const document_ = await session.send('DOM.getDocument', { depth: 0 })
+  const found = await session.send('DOM.querySelectorAll', { nodeId: document_.root.nodeId, selector })
+  const nodeId = found?.nodeIds?.[0]
+  if (!nodeId) throw new Error(`no element matched ${JSON.stringify(selector)}`)
+  await session.send('DOM.setFileInputFiles', { files, nodeId })
+  return { tabId: tab.id, target: params.ref ?? params.selector, files }
+}
+
+/** Override the viewport, which is how a site's mobile layout becomes reachable. */
+export async function setViewport(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  const width = Number(params.width ?? 0)
+  const height = Number(params.height ?? 0)
+  if (!(width > 0) || !(height > 0)) throw new Error('setViewport needs positive width and height')
+  await session.send('Emulation.setDeviceMetricsOverride', {
+    width,
+    height,
+    deviceScaleFactor: Number(params.deviceScaleFactor ?? 1),
+    mobile: params.mobile === true,
+  })
+  return { tabId: tab.id, width, height, mobile: params.mobile === true }
+}
+
+/** Drop the viewport override set by {@link setViewport}. */
+export async function clearViewport(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  await session.send('Emulation.clearDeviceMetricsOverride')
+  return { tabId: tab.id, cleared: true }
+}
+
+/** Emulate `prefers-color-scheme`, a media type, or print media. */
+export async function emulateMedia(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  const features = []
+  if (params.colorScheme === 'dark' || params.colorScheme === 'light') {
+    features.push({ name: 'prefers-color-scheme', value: params.colorScheme })
+  }
+  if (params.reducedMotion === 'reduce' || params.reducedMotion === 'no-preference') {
+    features.push({ name: 'prefers-reduced-motion', value: params.reducedMotion })
+  }
+  await session.send('Emulation.setEmulatedMedia', {
+    ...(params.media ? { media: String(params.media) } : {}),
+    features,
+  })
+  return { tabId: tab.id, media: params.media ?? null, features }
 }
 
 /* ------------------------------------------------------------- capture -- */
@@ -610,6 +770,20 @@ export async function dispatch(method, params) {
       return scroll(params)
     case 'page.waitFor':
       return waitFor(params)
+    case 'page.waitForNetworkIdle':
+      return waitForNetworkIdle(params)
+    case 'page.pendingDialog':
+      return pendingDialog(params)
+    case 'page.handleDialog':
+      return handleDialog(params)
+    case 'page.upload':
+      return uploadFile(params)
+    case 'page.setViewport':
+      return setViewport(params)
+    case 'page.clearViewport':
+      return clearViewport(params)
+    case 'page.emulateMedia':
+      return emulateMedia(params)
     case 'page.screenshot':
       return screenshot(params)
     case 'page.pdf':

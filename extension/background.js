@@ -21,7 +21,9 @@ const PROTOCOL_VERSION = 1
 const STORAGE_KEY = 'dsh-chrome-use/settings'
 const RECONNECT_ALARM = 'dsh-chrome-use/reconnect'
 const KEEPALIVE_ALARM = 'dsh-chrome-use/keepalive'
+const USER_STOPPED_KEY = 'dsh-chrome-use/userStopped'
 const PING_INTERVAL_MS = 20_000
+const SILENCE_LIMIT_MS = 75_000
 const MAX_BACKOFF_MS = 30_000
 
 /** @type {WebSocket | null} */
@@ -30,6 +32,15 @@ let socket = null
 let connecting = null
 let backoffMs = 500
 let pingTimer = null
+/** Timestamp of the newest frame from the host, for the silence check. */
+let lastFrameAt = 0
+/**
+ * Set when the user asked to disconnect. Only that starts a voluntary stop.
+ * A host-side close is a normal event — the plugin reloads, DSH restarts, the
+ * laptop sleeps — and must always bring the bridge back, so the close code
+ * alone cannot decide it: the host closes with 1000 and 1001 both.
+ */
+let stoppedByUser = false
 let lastStatus = { state: 'idle', detail: 'not connected', since: Date.now() }
 
 const DEFAULTS = {
@@ -49,6 +60,16 @@ async function writeSettings(patch) {
   const next = { ...current, ...patch }
   await chrome.storage.local.set({ [STORAGE_KEY]: next })
   return next
+}
+
+async function setUserStopped(value, { persist = true } = {}) {
+  stoppedByUser = value
+  if (persist) await chrome.storage.local.set({ [USER_STOPPED_KEY]: value })
+}
+
+async function readUserStopped() {
+  const stored = await chrome.storage.local.get(USER_STOPPED_KEY)
+  return stored[USER_STOPPED_KEY] === true
 }
 
 function setStatus(state, detail) {
@@ -75,6 +96,15 @@ function endpointFor(settings) {
 }
 
 async function connect({ manual = false } = {}) {
+  if (manual) {
+    await setUserStopped(false)
+  } else {
+    // The in-memory flag dies with the worker, so a revival driven by an alarm
+    // has to consult the persisted one; otherwise a user's explicit disconnect
+    // would be undone a minute later.
+    if (!stoppedByUser && (await readUserStopped())) stoppedByUser = true
+    if (stoppedByUser) return
+  }
   if (socket && socket.readyState <= WebSocket.OPEN) return
   if (connecting) return connecting
   connecting = (async () => {
@@ -99,16 +129,32 @@ async function connect({ manual = false } = {}) {
           resolve()
         }
       }
+      // A dial to a closed port can stall without ever firing open or error when
+      // the OS is slow to refuse it. Without this guard the single-flight
+      // promise never settles, and every later connect() call returns that same
+      // dead promise, leaving the extension permanently offline.
+      const dialTimer = setTimeout(() => {
+        setStatus('error', 'bridge did not answer within 10s; check the url and that DSH is running')
+        try {
+          socket?.close()
+        } catch {
+          /* already gone */
+        }
+        socket = null
+        finish()
+      }, 10_000)
       let ws
       try {
         ws = new WebSocket(endpoint)
       } catch (error) {
+        clearTimeout(dialTimer)
         setStatus('error', error instanceof Error ? error.message : String(error))
         finish()
         return
       }
       socket = ws
       ws.addEventListener('open', () => {
+        clearTimeout(dialTimer)
         backoffMs = 500
         startPing()
         ws.send(JSON.stringify({ type: 'hello', version: PROTOCOL_VERSION, browser: browserInfo(), agent: settings.agentLabel }))
@@ -120,17 +166,19 @@ async function connect({ manual = false } = {}) {
         void handleFrame(event.data)
       })
       ws.addEventListener('error', () => {
+        clearTimeout(dialTimer)
         if (ws.readyState !== WebSocket.OPEN) setStatus('error', 'bridge refused the connection; check the URL and token')
         finish()
       })
       ws.addEventListener('close', (event) => {
+        clearTimeout(dialTimer)
         stopPing()
         if (socket === ws) socket = null
-        if (event.code !== 1000) {
-          setStatus('disconnected', `closed (${event.code}) ${event.reason || ''}`.trim())
-          void scheduleReconnect()
+        if (stoppedByUser) {
+          setStatus('idle', 'disconnected by user')
         } else {
-          setStatus('idle', 'closed by host')
+          setStatus('disconnected', `closed (${event.code}) ${event.reason || 'no reason'}`.trim())
+          void scheduleReconnect()
         }
         finish()
       })
@@ -148,6 +196,7 @@ function send(value) {
 }
 
 async function handleFrame(raw) {
+  lastFrameAt = Date.now()
   let frame
   try {
     frame = JSON.parse(raw)
@@ -182,8 +231,27 @@ async function handleFrame(raw) {
 
 function startPing() {
   stopPing()
+  lastFrameAt = Date.now()
   pingTimer = setInterval(() => {
-    if (!send({ type: 'ping' })) stopPing()
+    if (!send({ type: 'ping' })) {
+      stopPing()
+      return
+    }
+    // A half-open socket — laptop suspended, VPN dropped, host killed without
+    // a FIN — still accepts writes. Silence is the only signal available, so an
+    // unanswered ping budget forces the socket closed and the reconnect runs.
+    if (Date.now() - lastFrameAt > SILENCE_LIMIT_MS) {
+      stopPing()
+      const dead = socket
+      socket = null
+      try {
+        dead?.close(4000, 'no frames from the host; reconnecting')
+      } catch {
+        /* already gone */
+      }
+      setStatus('disconnected', 'the bridge went silent; reconnecting')
+      void scheduleReconnect()
+    }
   }, PING_INTERVAL_MS)
 }
 
@@ -213,6 +281,7 @@ async function ensureKeepalive() {
 }
 
 async function disconnect() {
+  await setUserStopped(true)
   stopPing()
   await detachAll()
   if (socket) {

@@ -15,6 +15,7 @@
 
 /** Tag/role heuristics shared by the snapshot script. */
 const CORE = String.raw`
+  const REGISTRY = '__dshRefRegistry';
   const INTERACTIVE_TAGS = new Set(['A','BUTTON','INPUT','SELECT','TEXTAREA','SUMMARY','OPTION','LABEL','DETAILS']);
   const INTERACTIVE_ROLES = new Set(['button','link','checkbox','radio','switch','tab','menuitem','menuitemcheckbox','menuitemradio','option','textbox','searchbox','combobox','listbox','slider','spinbutton','treeitem','gridcell','cell']);
   const SKIP_TAGS = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','SVG','PATH','META','LINK','HEAD']);
@@ -104,6 +105,45 @@ const CORE = String.raw`
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   }
+  function shadowRootOf(el) {
+    try { return el.shadowRoot || null; } catch { return null; }
+  }
+  function sameOriginFrame(frame) {
+    try {
+      const doc = frame.contentDocument;
+      return doc && doc.body ? doc : null;
+    } catch { return null; }
+  }
+  function composedParent(el) {
+    if (el.parentElement) return el.parentElement;
+    const root = el.getRootNode && el.getRootNode();
+    return root && root.host ? root.host : null;
+  }
+  /**
+   * Hit-test the point and report the topmost element, crossing shadow boundaries
+   * and matching the composed path. \`elementFromPoint\` returns the shadow host for
+   * a control inside a shadow root, which would look like an overlay.
+   */
+  function topAt(x, y) {
+    if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return null;
+    let top = document.elementFromPoint(x, y);
+    while (top && shadowRootOf(top)) {
+      const inner = shadowRootOf(top).elementFromPoint(x, y);
+      if (!inner || inner === top) break;
+      top = inner;
+    }
+    return top;
+  }
+  /** True when \`el\` is \`top\` or inside it, following shadow roots and frames. */
+  function containsPoint(top, el) {
+    let node = top;
+    while (node) {
+      if (node === el) return true;
+      if (el.contains && el.contains(node)) return true;
+      node = composedParent(node);
+    }
+    return false;
+  }
 `
 
 /**
@@ -117,13 +157,44 @@ export function snapshotScript(options) {
   const OPT = ${JSON.stringify(options)};
   const root = OPT.selector ? document.querySelector(OPT.selector) : (document.body || document.documentElement);
   if (!root) return { ok: false, error: 'selector matched nothing: ' + OPT.selector };
+  // Refs describe the latest snapshot only: a scoped snapshot restarts at e1, so
+  // stale attributes from an earlier walk would win document order.
+  for (const stale of document.querySelectorAll('[data-dsh-ref]')) stale.removeAttribute('data-dsh-ref');
+  // The registry is the authority for ref -> element. It reaches elements inside
+  // open shadow roots and same-origin frames, which a document-wide CSS lookup
+  // cannot, and it carries the frame offset a synthesized click needs.
+  const registry = new Map();
+  try { Object.defineProperty(window, '__dshRefs', { value: registry, configurable: true, writable: true }); }
+  catch { window.__dshRefs = registry; }
   let nextRef = 0;
   const refs = [];
   const lines = [];
   let visited = 0;
   let truncated = false;
+  let framesWalked = 0;
 
-  function walk(el, depth) {
+  function descend(el, depth, offset) {
+    for (const child of el.children) walk(child, depth, offset);
+    const shadow = shadowRootOf(el);
+    if (shadow) {
+      lines.push('  '.repeat(depth) + '#shadow-root');
+      for (const child of shadow.children) walk(child, depth + 1, offset);
+    }
+    if (OPT.frames && (el.tagName === 'IFRAME' || el.tagName === 'FRAME')) {
+      framesWalked += 1;
+      const source = (el.getAttribute('src') || '(inline)').slice(0, 160);
+      const inner = sameOriginFrame(el);
+      if (!inner) {
+        lines.push('  '.repeat(depth) + '[cross-origin frame] ' + source + ' — open this url in its own tab to automate it');
+        return;
+      }
+      const box = el.getBoundingClientRect();
+      lines.push('  '.repeat(depth) + '[frame] ' + source);
+      for (const child of inner.body.children) walk(child, depth + 1, { x: offset.x + box.left, y: offset.y + box.top, frame: el });
+    }
+  }
+
+  function walk(el, depth, offset) {
     if (truncated) return;
     if (visited >= OPT.maxNodes) { truncated = true; return; }
     if (!el || !el.tagName) return;
@@ -139,6 +210,7 @@ export function snapshotScript(options) {
       nextRef += 1;
       const ref = 'e' + nextRef;
       el.setAttribute('data-dsh-ref', ref);
+      registry.set(ref, { el, x: offset.x, y: offset.y, frame: offset.frame });
       const entry = { ref, role, tag: el.tagName.toLowerCase(), name };
       if (el.tagName === 'A' && el.getAttribute('href')) entry.href = el.getAttribute('href').slice(0, 300);
       if (el.tagName === 'INPUT') {
@@ -152,6 +224,7 @@ export function snapshotScript(options) {
       }
       if (el.disabled) entry.disabled = true;
       if (el.isContentEditable) entry.editable = true;
+      if (offset.frame) entry.frame = true;
       refs.push(entry);
       const flags = [];
       if (entry.disabled) flags.push('disabled');
@@ -164,7 +237,7 @@ export function snapshotScript(options) {
       handled = true;
     }
     if (OPT.interactiveOnly) {
-      for (const child of el.children) walk(child, depth + (handled ? 1 : 0));
+      descend(el, depth + (handled ? 1 : 0), offset);
       return;
     }
     const ownText = handled ? '' : (el.innerText || '').replace(/\\s+/g, ' ').trim();
@@ -172,16 +245,17 @@ export function snapshotScript(options) {
       const clipped = ownText.length > OPT.maxText ? ownText.slice(0, OPT.maxText) + '...' : ownText;
       lines.push('  '.repeat(depth) + clipped);
     }
-    for (const child of el.children) walk(child, depth + (handled ? 1 : 0));
+    descend(el, depth + (handled ? 1 : 0), offset);
   }
 
-  walk(root, 0);
+  walk(root, 0, { x: 0, y: 0, frame: null });
   return {
     ok: true,
     url: location.href,
     title: document.title,
     readyState: document.readyState,
     nodesVisited: visited,
+    framesWalked,
     truncated,
     outline: lines.join('\\n'),
     refs,
@@ -204,19 +278,28 @@ export function focusScript({ ref, selector }) {
 /** Element geometry plus a viewport-visibility verdict, used before synthesized clicks. */
 export function rectScript({ ref, selector }) {
   return `(() => {
-  const el = ${resolveExpression({ ref, selector })};
+  ${CORE}
+  const entry = ${resolveEntry({ ref, selector })};
+  const el = entry.el;
   if (!el) return { ok: false, error: 'element not found' };
   el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
   const rect = el.getBoundingClientRect();
-  const cx = rect.x + rect.width / 2;
-  const cy = rect.y + rect.height / 2;
-  const top = document.elementFromPoint(cx, cy);
+  // A ref inside a same-origin frame reports frame-local geometry; the click is
+  // dispatched against the top-level viewport, so shift it by the frame skew.
+  const cx = rect.x + rect.width / 2 + entry.dx;
+  const cy = rect.y + rect.height / 2 + entry.dy;
+  // Frame-local geometry cannot be hit-tested against the top document, so the
+  // coverage check only runs for same-document refs.
+  const top = entry.dx || entry.dy ? null : topAt(cx, cy);
+  const covered = top && !containsPoint(top, el)
+    ? (top.tagName.toLowerCase() + (top.id ? '#' + top.id : ''))
+    : null;
   return {
     ok: true,
     x: cx, y: cy,
     width: rect.width, height: rect.height,
     inViewport: cx >= 0 && cy >= 0 && cx <= innerWidth && cy <= innerHeight,
-    coveredBy: top && top !== el && !el.contains(top) ? (top.tagName.toLowerCase() + (top.id ? '#' + top.id : '')) : null,
+    coveredBy: covered,
   };
 })()`
 }
@@ -297,11 +380,33 @@ export function waitScript({ kind, value, timeoutMs, pollMs }) {
 
 /**
  * Expression that resolves an element from either a ref or a CSS selector.
- * Throws inside the page when a ref is present but stale.
+ *
+ * The registry installed by the last snapshot wins over the DOM attribute: an
+ * element inside an open shadow root or a same-origin frame carries a ref but
+ * is unreachable from a document-wide lookup.
  */
 function resolveExpression({ ref, selector }) {
   if (ref) {
-    return `document.querySelector('[data-dsh-ref="' + ${JSON.stringify(ref)} + '"]')`
+    return `(() => {
+    const hit = window.__dshRefs && window.__dshRefs.get(${JSON.stringify(ref)});
+    if (hit && hit.el && hit.el.isConnected) return hit.el;
+    return document.querySelector('[data-dsh-ref="' + ${JSON.stringify(ref)} + '"]');
+  })()`
   }
   return `document.querySelector(${JSON.stringify(selector)})`
+}
+
+/**
+ * Expression that resolves both the element and the viewport skew of the frame
+ * it lives in, so a synthesized click lands on the right coordinate.
+ */
+function resolveEntry({ ref, selector }) {
+  if (ref) {
+    return `(() => {
+    const hit = window.__dshRefs && window.__dshRefs.get(${JSON.stringify(ref)});
+    if (hit && hit.el && hit.el.isConnected) return { el: hit.el, dx: hit.x || 0, dy: hit.y || 0 };
+    return { el: document.querySelector('[data-dsh-ref="' + ${JSON.stringify(ref)} + '"]'), dx: 0, dy: 0 };
+  })()`
+  }
+  return `(() => ({ el: document.querySelector(${JSON.stringify(selector)}), dx: 0, dy: 0 }))()`
 }
