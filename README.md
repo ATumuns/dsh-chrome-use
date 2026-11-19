@@ -169,7 +169,14 @@ node scripts/make-icons.mjs       # 从几何描述重建 PNG 图标
 
 `lib/ws.js` 是一份不依赖第三方包的 RFC 6455 服务端实现（故意不支持 `permessage-deflate`）。原因很实际：`ws` 在 profile 的 `node_modules` 里能被解析到纯属依赖提升的巧合，而一个本地 bundle 不能建立在巧合上。
 
-改完代码要**禁用再启用** bundle 才会重载（改文件不触发热更）；扩展要用户在 `chrome://extensions` 点刷新才会换新代码——扩展自动重连不等于重载。
+改完代码要**禁用再启用** bundle 才会重载（改文件不触发热更）。
+
+扩展这边有个坑：**自动重连和真的换代码看起来一模一样**——service worker 被回收后靠 `chrome.alarms` 重连，连接状态照样是「已连接」，但跑的还是旧代码。所以：
+
+- `chrome_use_status` 会打印 `build 2026-11-19.2` 这样的戳（`extension/background.js` 顶部的 `BUILD` 常量，改代码时顺手改一下）。
+- 扩展这边第一次换代码仍然要在 `chrome://extensions` 点一次刷新；之后就可以用 `chrome_use_status {reloadExtension: true}`——它让 worker 自己 `chrome.runtime.reload()`，再等一个**不同的 clientId** 回来，20 秒内没回来就明说要去手动点。
+
+版本历史见 `CHANGELOG.md`。
 
 ## 目录
 
