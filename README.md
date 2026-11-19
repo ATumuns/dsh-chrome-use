@@ -9,12 +9,14 @@ DSH (host bundle)                         Chrome
 ┌──────────────────────────┐             ┌───────────────────────────┐
 │ ctx.webServer            │  WebSocket  │ MV3 extension             │
 │  /dsh-chrome-use/bridge  │◀────────────│  background.js (service   │
-│                          │  拨出 + token│  worker)                  │
-│ lib/tools.js             │             │      │                    │
-│  chrome_use_*  ×7        │             │      ▼                    │
-│                          │             │ chrome.debugger (CDP)     │
-└──────────────────────────┘             │ chrome.tabs / scripting   │
-                                          └───────────────────────────┘
+│  /dsh-chrome-use/state   │  拨出 + token│  worker)                  │
+│  /dsh-chrome-use/settings│◀────────────│                           │
+│                          │  插件页轮询  │      │                    │
+│ lib/tools.js             │             │      ▼                    │
+│  chrome_use_*  ×7        │             │ chrome.debugger (CDP)     │
+│ lib/client.js            │             │ chrome.tabs / scripting   │
+│  （插件设置页）           │             │                           │
+└──────────────────────────┘             └───────────────────────────┘
 ```
 
 ## 为什么是 WebSocket 直连
@@ -37,16 +39,19 @@ DSH (host bundle)                         Chrome
 | `chrome_use_tabs` | `list` / `open` / `close` / `activate` / `resize` / `group` |
 | `chrome_use_navigate` | 打开 URL，或 `back` / `forward` |
 | `chrome_use_snapshot` | 把页面读成带 `ref` 的大纲（可只要可交互元素、可附带截图） |
-| `chrome_use_interact` | `click` `hover` `type` `press` `select` `scroll` `focus` `wait`，用快照给的 `ref` 定位 |
-| `chrome_use_read` | `evaluate` 表达式 / `console` / `network` / `responseBody` / `storage` / `cookies` |
+| `chrome_use_interact` | `click` `hover` `type` `press` `select` `scroll` `focus` `wait` `upload` `dialog` `waitIdle` `viewport` `media`，用快照给的 `ref` 定位 |
+| `chrome_use_read` | `evaluate` 表达式 / `console` / `network` / `responseBody` / `storage` / `cookies` / `dialog` |
 | `chrome_use_capture` | `screenshot` / `pdf` / `download` |
 
 设计取舍：
 - **`ref` 而不是 CSS 选择器**。快照给每个可见的可交互元素盖一个 `data-dsh-ref`，交互工具只认这个。页面重排、类名混淆、Shadow DOM 都不影响——而且模型不必猜选择器。导航会失效所有 `ref`，所以改完页面要重新快照。
 - **快照是"用户看得见的东西"**。可见性按 `display`/`visibility`/`opacity`/非零 rect 判定，`aria-hidden="true"` 子树整棵跳过。不会把整页 HTML 倒给模型。
-- **交互走 CDP 的 `Input.*`**，不是 `element.click()`。真实的鼠标事件序列才能触发现有前端框架的事件链；被浮层遮挡时会明确报 `element is covered by …`，而不是静默失败。
+- **快照穿 Shadow DOM 与同源 iframe**。开放的 shadow root 会展开成 `#shadow-root` 段落，同源 frame 展开成 `[frame]` 段落并继承坐标系偏移；跨源 frame 只报出 `src`，提示把它当独立标签页打开。`ref` 的解析走页面内的 registry（`window.__dshRefs`），所以 shadow 里的控件也能点到。
+- **交互走 CDP 的 `Input.*`**，不是 `element.click()`。真实的鼠标事件序列才能触发现有前端框架的事件链；被浮层遮挡时会明确报 `element is covered by …`，而不是静默失败。遮挡判定按 shadow 穿透后的最上层元素算，否则 shadow 里的控件会被自己的宿主误判为被遮挡。
+- **JS 对话框不会把工具卡死**。弹窗会暂停渲染进程，开弹窗的那条 CDP 命令永远不返回，`Page.handleJavaScriptDialog` 又排在同一条队列后面。所以带 `releaseOnDialog` 的命令在收到 `Page.javascriptDialogOpening` 或 12 秒看门狗到期时被放弃（返回 `ABANDONED` 而不是错误——动作确实发生了），回答对话框走旁路队列。
 - **截图走 attachments 服务**。图片是 DSH 的 `image` content block，不是 base64 文本塞进上下文。
 - **页面内脚本是 `Runtime.evaluate` 的 IIFE 字符串**，不是持久注入。绕开页面 CSP，也不在用户页面里留任何东西。
+
 
 ## 安装
 
@@ -76,7 +81,18 @@ dsh-chrome-use: load the extension from …\dsh-chrome-use\extension — chrome:
 
 Edge 走 `edge://extensions`，步骤一样。
 
-### 3. 验证
+### 3. 插件页
+
+装完之后，**设置 → 插件 → 已安装**里找到「DSH Chrome Use」，点开卡片标题，描述与行列表之间就是本插件自己的页面：
+
+- **浏览器连接**：桥接地址、版本、连接状态；配对令牌默认打码，可显示 / 复制 / 轮换；令牌来源（`config` / `file` / `generated`）与落盘路径。
+- **运行状态**：每个已连接浏览器的 clientId、标签、浏览器版本、接入时间、在途命令数；能力位与「设置是否已写入 profile」。
+- **功能开关**：`注册工具` / `系统提示词段落` / `只读模式` / `允许 evaluate` 四个总闸，加每个工具一个开关；改动要按「保存开关」才写盘，回到默认值会自动删掉配置行。
+- **功能清单**：七个工具当前是否可用，以及不可用时是哪一条规则挡住的。
+
+页面每 4 秒轮询 `/dsh-chrome-use/state`。它读的是 host 侧的真实现状，不是自己记的镜像。
+
+### 4. 验证
 
 问 DSH「用 chrome_use_status 看看」——应该看到 `connected: true` 和一行浏览器信息。
 
@@ -89,12 +105,18 @@ Edge 走 `edge://extensions`，步骤一样。
     - id: chrome-use
       name: dsh-chrome-use
       config:
-        token: ''        # 留空 = 每次启动随机生成
-        tools: true      # false = 只连桥，不注册工具
-        prompt: true     # false = 不注入系统提示段
+        token: ''          # 留空 = 首次启动随机生成后落盘复用
+        tools: true        # false = 只连桥，不注册工具
+        prompt: true       # false = 不注入系统提示段
+        readOnly: false    # true = 只留观察者工具（status/tabs/snapshot/read/capture）
+        allowEvaluation: true  # false = chrome_use_read 的 evaluate 被拒
+        disabledTools: []  # 逐工具关掉
 ```
 
-`token` 固定下来适合反复重启的场景；留空则每次启动换一个，安全性更好。
+`token` 固定下来适合反复重启的场景；留空则首次生成后写进 `~/.dsh/dsh-chrome-use/token`，之后复用——否则每次重载插件都会让已经配好的扩展连不上。
+
+这一行也可以完全由插件页写：`POST /dsh-chrome-use/settings` 走 `configEditor`，由它改写 patch 行、跑 schema 校验、原子写盘、再触发本 bundle 重载。未知键和非法值一律 400，不会被静默丢弃。
+
 
 ## 扩展权限
 
@@ -107,41 +129,54 @@ manifest 申请了 `debugger`、`tabs`、`tabGroups`、`scripting`、`storage`�
 - 桥只绑在 DSH 已经在监听的 loopback 上，不额外监听。
 - 握手要令牌 + 协议版本，令牌用 `timingSafeEqual` 比对。
 - 令牌只在 `chrome_use_status` 的输出里出现一次；轮换后旧连接不会被主动踢，但新握手会失败。
+- 插件页的三个路由先跑 DSH 自己的 `connection.requestRejection`：跨源 403、没有浏览器登录 cookie 401。持有配对令牌的本地调用方可以用 `?token=` 旁路 cookie 这一关（令牌本来就是它们手里的凭据），但跨源请求即使带对了令牌也仍然是 403。
+- `POST` 的请求体有 16 KiB 上限，只收 JSON 对象。
 - 扩展端不落任何站点凭据：cookie 读写都是转发给 CDP，不在本地留存。
 - `chrome://`、`about:`、`devtools:`、扩展页本身拒绝自动化（Chrome 自己也不允许）。
 
 ## 开发
 
 ```
-node test/ws-bridge.test.mjs     # 协议层：握手/令牌/超时/大帧/断线
-node scripts/make-icons.mjs      # 从几何描述重建 PNG 图标
-node --check lib/tools.js        # 任一模块的语法检查
+node _work/run-tests.mjs          # 全部测试（_work/ 不在仓库里，直接跑 test/ 下的文件）
+node test/ws-bridge.test.mjs      # 协议层：握手/令牌/超时/大帧/断线
+node test/bundle-shape.test.mjs   # loader 看到的是 default 导出，Config 必须在上面
+node test/settings.test.mjs       # 设置归一化、写盘、拒绝语义、路由栅栏
+node test/tool-contract.test.mjs  # host 发的方法名与扩展的 case 双向对齐
+node test/dialog.test.mjs         # 看门狗放弃命令、对话框旁路
+node scripts/make-icons.mjs       # 从几何描述重建 PNG 图标
 ```
 
 `lib/ws.js` 是一份不依赖第三方包的 RFC 6455 服务端实现（故意不支持 `permessage-deflate`）。原因很实际：`ws` 在 profile 的 `node_modules` 里能被解析到纯属依赖提升的巧合，而一个本地 bundle 不能建立在巧合上。
+
+改完代码要**禁用再启用** bundle 才会重载（改文件不触发热更）；扩展要用户在 `chrome://extensions` 点刷新才会换新代码——扩展自动重连不等于重载。
 
 ## 目录
 
 ```
 dsh-chrome-use/
 ├── lib/
-│   ├── index.js      插件入口：认领升级路径、注册工具、注入提示段
+│   ├── index.js      插件入口：认领升级路径、注册工具、注入提示段、挂路由
 │   ├── bridge.js     连接注册表、令牌握手、命令/应答编解码
 │   ├── tools.js      七个工具的定义（纯对象，自校验参数）
 │   ├── validate.js   参数校验（DSH 只校验 output.schema）
-│   └── ws.js         RFC 6455 服务端
+│   ├── ws.js         RFC 6455 服务端
+│   ├── settings.js   设置归一化 + Config（Standard Schema）
+│   ├── control.js    快照与写盘，设置页的唯一数据源
+│   ├── routes.js     /state /settings /token 三个 loopback 路由
+│   └── client.js     插件页（浏览器端 React 组件）
 ├── extension/
 │   ├── manifest.json MV3
 │   ├── background.js 拨出、重连、命令分发
-│   ├── lib/cdp.js    debugger 会话、控制台/网络环形缓冲
+│   ├── lib/cdp.js    debugger 会话、控制台/网络环形缓冲、对话框看门狗
 │   ├── lib/actions.js 方法实现
 │   ├── lib/page-scripts.js 页面内 IIFE（快照/定位/存储/等待）
 │   ├── popup.*       状态与开关
 │   └── options.*     桥接地址、令牌、标签
 ├── locale/           插件卡片文案
-├── test/             协议层测试
+├── test/             协议层、设置、契约、对话框测试
 └── scripts/          图标生成
 ```
+
 
 ## 已知边界
 
@@ -149,6 +184,9 @@ dsh-chrome-use/
 - 一个 DSH 可以连多个浏览器（多台机器、多个 profile），工具参数 `browser` 按 id 或标签选。
 - 控制台和网络缓冲是按标签页的环形缓冲，上限 400 / 300 条，读了就清不掉的会覆盖最旧的。
 - PDF 用 `Page.printToPDF`，无头和有头行为在部分站点上不同。
+- 队列是**按标签页**串行的。同一个标签页上的命令互相排队（否则对话框、导航、点击会互相踩），不同标签页之间天然并行。
+- 跨源 iframe 只报出 `src`，不进去。要操作它就在独立标签页打开——`chrome.debugger` 是按标签页 attach 的，跨源 frame 的坐标系也不属于当前文档。
+- 插件页依赖浏览器的登录 cookie（或本地调用方持令牌时的 `?token=`）。在 DSH 桌面窗口里它随应用一起加载；用新标签页直接访问 `127.0.0.1:<port>` 会被 401 挡住，因为签 cookie 需要只存在于 host 内存里的 launch token。
 
 ## License
 
