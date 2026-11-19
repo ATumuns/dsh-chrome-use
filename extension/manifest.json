@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DSH-Chrome-Use",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Lets DeepSeek Harness drive this Chromium browser over CDP: tab control, accessibility snapshots, clicking, typing, screenshots, network and console capture.",
   "minimum_chrome_version": "116",
   "background": {

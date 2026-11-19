@@ -2,6 +2,42 @@
 
 按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 组织，版本号遵循语义化版本。
 
+## [1.0.1] — 2026-11-19
+
+在真实 Chrome 157 上把 v1.0.0 的工具面逐项跑了一遍，修掉四个只有跑真浏览器才会暴露的缺陷。
+桩测试看不到它们，因为问题都出在 Chrome 怎么应答 CDP，而不是调用的形状。
+
+### 修正
+
+- `windowState` 在同时传 `focused: false` 和 `state` 时被 Chrome 整体拒绝（`Invalid value for state`）。
+  `focused` 现在只在真要聚焦时才发出去，结果等价：窗口照样变，桌面照样不被抢。
+- `drag` 会死锁。按下之后浏览器进程扣住后续每个鼠标事件的 ack 直到手势结束，
+  逐条 await 中间移动就把该标签页的队列占死了。更糟的是按压标志是进程级的：
+  一次卡住的 press 会让**所有标签页**的点击被静默吞掉（hover 还正常）。
+  现在中间移动并发发出不等 ack，抬起有自己的截止时间，失败时用
+  `Input.cancelDragging` + 视口中心释放来复位（`(0,0)` 会被判越界，反而清不掉标志）。
+- `fill` 缺少逐字段前置校验，坏选择器会把文本送进当前获得焦点的字段。
+  现在每个字段先探一次，分别报「找不到 / 只读 / 文件输入 / checkbox 等无文本可填 / select 需要 kind」。
+- `geolocation` 单靠 `Emulation.setGeolocationOverride` 不生效：权限停在 `prompt`，
+  `getCurrentPosition` 直接超时。必须先按站点写一条 `chrome.contentSettings.location`
+  （类型名是 `location` 不是 `geolocation`）的 allow。
+- `timezone` 用不了 CDP 的时区覆盖（`only available to trusted clients`），
+  改为页面级 Date/Intl shim + `Page.addScriptToEvaluateOnNewDocument`，跨导航存活。
+
+### 新增
+
+- `chrome_use_interact` 新增 `reset`：`Input.cancelDragging` + 视口中心释放，解掉卡住的按压态。
+- 扩展权限新增 `contentSettings`、`geolocation`（只服务 `action geolocation`）。
+- `_work/api-push.mjs`：`github.com:443` 不通时用 Git Data API 推出**同一个** commit sha。
+
+### 实测
+
+夹具页 `http://127.0.0.1:4599/`，Chrome 157：独立窗口（background + minimized）、
+windowState normal/minimized/maximized、closeWindow、drag 真实 drop、fill 拒绝文件输入、
+handoff 由人点击后继续、slow3g 447ms vs 3ms、offline、network clear、
+geolocation 35.6762/139.6503、timezone Asia/Tokyo 跨导航、markdown 35 chars、
+table Pricing、metrics、元素截图 320x120、reloadExtension。
+
 ## [1.0.0] — 2026-11-19
 
 第一个可用于日常的版本：七个工具覆盖「读页面 / 点东西 / 抓证据 / 换环境 / 无人值守」，
