@@ -36,12 +36,33 @@ DSH (host bundle)                         Chrome
 | 工具 | 干什么 |
 | --- | --- |
 | `chrome_use_status` | 连接状态、配对令牌（可轮换）、扩展自报的浏览器信息 |
-| `chrome_use_tabs` | `list` / `open` / `close` / `activate` / `resize` / `group` |
+| `chrome_use_tabs` | `list` / `open` / `close` / `activate` / `resize` / `group` / `window` / `windowState` / `closeWindow` |
 | `chrome_use_navigate` | 打开 URL，或 `back` / `forward` |
 | `chrome_use_snapshot` | 把页面读成带 `ref` 的大纲（可只要可交互元素、可附带截图） |
-| `chrome_use_interact` | `click` `hover` `type` `press` `select` `scroll` `focus` `wait` `upload` `dialog` `waitIdle` `viewport` `media`，用快照给的 `ref` 定位 |
-| `chrome_use_read` | `evaluate` 表达式 / `console` / `network` / `responseBody` / `storage` / `cookies` / `dialog` |
-| `chrome_use_capture` | `screenshot` / `pdf` / `download` |
+| `chrome_use_interact` | `click` `hover` `type` `press` `select` `scroll` `focus` `wait` `drag` `fill` `upload` `dialog` `waitIdle` `handoff` `viewport` `media` `network` `geolocation` `timezone` |
+| `chrome_use_read` | `evaluate` / `console` / `network` / `responseBody` / `storage` / `cookies` / `dialog` / `markdown` / `table` / `metrics` |
+| `chrome_use_capture` | `screenshot`（整页 / 视口 / 单个元素） / `pdf` / `download` |
+
+### 无人值守：独立子窗口
+
+`chrome_use_tabs action window` 用 `chrome.windows.create({focused: false})` 开一个**新窗口**，它不抢焦点、不打断你正在做的事——模型在里面点击和输入，你的鼠标和键盘仍然归你。`action windowState`（`state` + `focused`）可以最小化、还原或把窗口调到前台；`action closeWindow` 关掉它（只剩一个窗口时拒绝，避免把浏览器关掉）。同一个任务里先用 `action tabs list` 拿到窗口里的 `tabId`，其余工具照常接受 `tabId`。
+
+### 批量与人工接力
+
+- `action fill`：一次传 `fields: [{ref|selector, text|value, replace?, kind?, submit?}]` 填完整个表单，比逐字段 `type` 少 n 次往返。逐项容错，返回值里每个字段都有自己的 `ok` / 错误。
+- `action handoff`：在页面底部画一条提示栏，等你亲手登录或确认支付，点按钮后模型继续。**不要在需要密码或验证码的地方硬试**——交给这条动作。
+- `action drag`：从 `ref` 拖到 `toRef`，发完整鼠标按下／移动／抬起序列（12 步插值），排序、滑块、拖放上传都能用。
+
+### 省钱地读页面
+
+- `action markdown`：把正文转成 markdown（readability-lite：先按文字密度挑主容器，再渲染标题／段落／列表／代码块／表格）。只想要文字时它比快照便宜得多。
+- `action table`：把页面里的表格直接读成「表头 + 行」，最多 8 张表、每张 200 行。
+- `action metrics`：DOM 节点数、JS 堆、layout／recalc 次数、脚本与任务耗时、CLS。排查「为什么这页卡」时先看它。
+- `chrome_use_capture` 传 `ref` 或 `selector` 只截那一个元素，整页截图在长页上会糊到看不清。
+
+### 设备与网络模拟
+
+`action viewport`（宽高、`deviceScaleFactor`、`mobile`）、`action media`（`colorScheme`、`media`）、`action network`（`preset: offline|slow3g|fast3g|slow4g`，或 `latency`/`downloadKbps`/`uploadKbps`；`offline: true` 直接断网）、`action geolocation`（经纬度 + 精度）、`action timezone`（IANA 名）。每一项都接受 `clear: true` 还原真实值。
 
 设计取舍：
 - **`ref` 而不是 CSS 选择器**。快照给每个可见的可交互元素盖一个 `data-dsh-ref`，交互工具只认这个。页面重排、类名混淆、Shadow DOM 都不影响——而且模型不必猜选择器。导航会失效所有 `ref`，所以改完页面要重新快照。
@@ -88,7 +109,7 @@ Edge 走 `edge://extensions`，步骤一样。
 - **浏览器连接**：桥接地址、版本、连接状态；配对令牌默认打码，可显示 / 复制 / 轮换；令牌来源（`config` / `file` / `generated`）与落盘路径。
 - **运行状态**：每个已连接浏览器的 clientId、标签、浏览器版本、接入时间、在途命令数；能力位与「设置是否已写入 profile」。
 - **功能开关**：`注册工具` / `系统提示词段落` / `只读模式` / `允许 evaluate` 四个总闸，加每个工具一个开关；改动要按「保存开关」才写盘，回到默认值会自动删掉配置行。
-- **功能清单**：七个工具当前是否可用，以及不可用时是哪一条规则挡住的。
+- **功能清单**：七个工具各占一行——工具名、一句功能简述、当前是否可用，以及不可用时是哪一条规则挡住的。
 
 页面每 4 秒轮询 `/dsh-chrome-use/state`。它读的是 host 侧的真实现状，不是自己记的镜像。
 
@@ -186,6 +207,9 @@ dsh-chrome-use/
 - PDF 用 `Page.printToPDF`，无头和有头行为在部分站点上不同。
 - 队列是**按标签页**串行的。同一个标签页上的命令互相排队（否则对话框、导航、点击会互相踩），不同标签页之间天然并行。
 - 跨源 iframe 只报出 `src`，不进去。要操作它就在独立标签页打开——`chrome.debugger` 是按标签页 attach 的，跨源 frame 的坐标系也不属于当前文档。
+- 独立子窗口里的标签页和普通标签页一样受「按标签页串行」约束；窗口本身不抢焦点，但它里面的页面仍然可能弹系统级对话框（下载、权限），这些只能由用户在本机点。
+- `action handoff` 等的是**人**，不是模型：超时（默认 10 分钟）后返回 `resumed: false`，页面上的提示栏会被移除。
+- `action markdown` / `action table` 是页面内的一次性抽取，不执行页面的路由跳转；SPA 里只渲染了一屏的内容，需要先滚动或点开再抽。
 - 插件页依赖浏览器的登录 cookie（或本地调用方持令牌时的 `?token=`）。在 DSH 桌面窗口里它随应用一起加载；用新标签页直接访问 `127.0.0.1:<port>` 会被 401 挡住，因为签 cookie 需要只存在于 host 内存里的 launch token。
 
 ## License

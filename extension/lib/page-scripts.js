@@ -263,6 +263,222 @@ export function snapshotScript(options) {
 })()`
 }
 
+/**
+ * Turn the readable part of the page into markdown.
+ *
+ * This is deliberately a small readability heuristic rather than a full port: it
+ * picks the densest article-ish container, drops chrome (nav/footer/aside/form),
+ * and emits headings, paragraphs, lists, quotes, code and links. The model reads
+ * this instead of a raw HTML dump, which is both smaller and closer to what a
+ * human sees.
+ *
+ * @param {{ selector?: string | null, maxChars?: number }} options
+ * @returns {string} IIFE source.
+ */
+export function markdownScript({ selector = null, maxChars = 20_000 } = {}) {
+  return `(() => {
+  ${CORE}
+  const OPT = ${JSON.stringify({ selector, maxChars })};
+  const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','SVG','CANVAS','IFRAME','HEAD','META','LINK','NAV','FOOTER','ASIDE','FORM','BUTTON','SELECT','TEXTAREA','INPUT']);
+  const BLOCK = new Set(['P','DIV','SECTION','ARTICLE','MAIN','HEADER','UL','OL','LI','TABLE','PRE','BLOCKQUOTE','H1','H2','H3','H4','H5','H6','FIGURE','FIGCAPTION','DL','DT','DD','TR','BR','HR']);
+
+  function textOf(el) {
+    return (el.innerText || el.textContent || '').replace(/\\u00a0/g, ' ').replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();
+  }
+  function density(el) {
+    const text = textOf(el);
+    if (text.length < 200) return 0;
+    const links = el.querySelectorAll('a').length;
+    const linkText = [...el.querySelectorAll('a')].reduce((sum, a) => sum + (a.innerText || '').length, 0);
+    const linkShare = text.length === 0 ? 1 : linkText / text.length;
+    return text.length * (1 - Math.min(linkShare, 1));
+  }
+  function pickRoot() {
+    if (OPT.selector) return document.querySelector(OPT.selector);
+    const candidates = [...document.querySelectorAll('article, main, [role="main"], .article, .post, .content, #content, .markdown-body')];
+    let best = null;
+    let bestScore = 0;
+    for (const node of candidates) {
+      if (!isVisible(node)) continue;
+      const score = density(node);
+      if (score > bestScore) { bestScore = score; best = node; }
+    }
+    if (best) return best;
+    const body = document.body || document.documentElement;
+    const [biggest] = [...body.querySelectorAll('div, section')].map((n) => [n, density(n)]).sort((a, b) => b[1] - a[1]);
+    return biggest && biggest[1] > 0 ? biggest[0] : body;
+  }
+
+  function inlineOf(el) {
+    let out = '';
+    for (const node of el.childNodes) {
+      if (node.nodeType === 3) { out += node.nodeValue.replace(/\\s+/g, ' '); continue; }
+      if (node.nodeType !== 1) continue;
+      const tag = node.tagName;
+      if (SKIP.has(tag)) continue;
+      if (tag === 'BR') { out += '\\n'; continue; }
+      if (tag === 'A') {
+        const label = textOf(node).replace(/\\s+/g, ' ');
+        const href = node.getAttribute('href') || '';
+        out += href && !href.startsWith('javascript:') ? '[' + label + '](' + href.slice(0, 300) + ')' : label;
+        continue;
+      }
+      if (tag === 'STRONG' || tag === 'B') { out += '**' + inlineOf(node).trim() + '**'; continue; }
+      if (tag === 'EM' || tag === 'I') { out += '_' + inlineOf(node).trim() + '_'; continue; }
+      if (tag === 'CODE') { out += '\`' + textOf(node) + '\`'; continue; }
+      if (tag === 'IMG') {
+        const alt = node.getAttribute('alt') || '';
+        const src = node.getAttribute('src') || '';
+        if (src) out += '![' + alt.slice(0, 80) + '](' + src.slice(0, 300) + ')';
+        continue;
+      }
+      out += inlineOf(node);
+    }
+    return out;
+  }
+
+  function render(el, depth) {
+    if (out.length > OPT.maxChars) { truncated = true; return; }
+    if (!el || !el.tagName) return;
+    if (SKIP.has(el.tagName)) return;
+    if (el.hasAttribute && el.getAttribute('aria-hidden') === 'true') return;
+    if (!isVisible(el)) return;
+    const tag = el.tagName;
+    if (/^H[1-6]$/.test(tag)) {
+      const level = '#'.repeat(Number(tag.slice(1)));
+      push(level + ' ' + inlineOf(el).replace(/\\s+/g, ' ').trim());
+      return;
+    }
+    if (tag === 'P') { push(inlineOf(el).replace(/\\s+/g, ' ').trim()); return; }
+    if (tag === 'UL' || tag === 'OL') {
+      let index = 1;
+      for (const li of el.children) {
+        if (li.tagName !== 'LI') continue;
+        const marker = tag === 'OL' ? (index++) + '. ' : '- ';
+        const nested = [...li.children].filter((child) => child.tagName === 'UL' || child.tagName === 'OL');
+        const own = inlineOf(li).replace(/\\s+/g, ' ').trim();
+        push('  '.repeat(depth) + marker + (own || ''));
+        for (const sub of nested) render(sub, depth + 1);
+      }
+      return;
+    }
+    if (tag === 'PRE') {
+      const code = (el.innerText || '').replace(/\\s+$/, '');
+      push('\`\`\`' + '\\n' + code + '\\n' + '\`\`\`');
+      return;
+    }
+    if (tag === 'BLOCKQUOTE') {
+      const quote = textOf(el).split('\\n').map((line) => '> ' + line).join('\\n');
+      push(quote);
+      return;
+    }
+    if (tag === 'TABLE') {
+      const rows = [...el.querySelectorAll('tr')].slice(0, 60).map((tr) =>
+        [...tr.children].map((cell) => (cell.innerText || '').replace(/\\s+/g, ' ').trim()).join(' | '));
+      if (rows.length) push(rows.map((row) => '| ' + row + ' |').join('\\n'));
+      return;
+    }
+    if (tag === 'HR') { push('---'); return; }
+    if (!BLOCK.has(tag)) {
+      const inline = inlineOf(el).replace(/\\s+/g, ' ').trim();
+      if (inline) push(inline);
+      return;
+    }
+    for (const child of el.children) render(child, depth);
+  }
+
+  const out = [];
+  let truncated = false;
+  function push(line) {
+    const trimmed = (line || '').trim();
+    if (!trimmed) return;
+    out.push(trimmed);
+    if (out.join('\\n\\n').length > OPT.maxChars) truncated = true;
+  }
+
+  const root = pickRoot();
+  if (!root) return { ok: false, error: 'page has no readable body yet' };
+  render(root, 0);
+  let markdown = out.join('\\n\\n');
+  if (markdown.length > OPT.maxChars) { markdown = markdown.slice(0, OPT.maxChars); truncated = true; }
+  return {
+    ok: true,
+    url: location.href,
+    title: document.title,
+    chars: markdown.length,
+    truncated,
+    markdown,
+  };
+})()`
+}
+
+/**
+ * Collect every table on the page as header/rows pairs.
+ *
+ * A model that has to count columns out of an outline gets it wrong; handing it
+ * row objects it can index is both smaller and unambiguous.
+ */
+export function tableScript({ selector = null, maxTables = 8, maxRows = 200 } = {}) {
+  return `(() => {
+  ${CORE}
+  const OPT = ${JSON.stringify({ selector, maxTables, maxRows })};
+  const roots = OPT.selector ? [...document.querySelectorAll(OPT.selector)] : [...document.querySelectorAll('table')];
+  const tables = [];
+  for (const table of roots.slice(0, OPT.maxTables)) {
+    if (!isVisible(table)) continue;
+    const rows = [...table.querySelectorAll('tr')].slice(0, OPT.maxRows).map((tr) => [...tr.children]
+      .filter((cell) => cell.tagName === 'TD' || cell.tagName === 'TH')
+      .map((cell) => (cell.innerText || '').replace(/\\s+/g, ' ').trim()));
+    if (rows.length === 0) continue;
+    const first = table.querySelector('tr');
+    const headerCells = first ? [...first.children].filter((cell) => cell.tagName === 'TH') : [];
+    const header = headerCells.length > 0
+      ? headerCells.map((cell) => (cell.innerText || '').replace(/\\s+/g, ' ').trim())
+      : null;
+    const body = header ? rows.slice(1) : rows;
+    tables.push({
+      header,
+      rows: body,
+      rowCount: body.length,
+      caption: (table.caption ? table.caption.innerText : '').trim().slice(0, 200) || null,
+    });
+  }
+  return { ok: true, url: location.href, count: tables.length, tables };
+})()`
+}
+
+/**
+ * Show a banner the human can click when a task needs a real person.
+ *
+ * Automation stalls on CAPTCHA, 2FA and payment confirmation. Rather than
+ * guessing, the agent parks here: the banner explains what is needed, the tab is
+ * brought forward, and the tool resolves the moment the person presses continue.
+ */
+export function handoffScript({ message, buttonLabel }) {
+  return `(() => new Promise((resolve) => {
+  const ID = '__dsh_handoff__';
+  const existing = document.getElementById(ID);
+  if (existing) existing.remove();
+  const host = document.createElement('div');
+  host.id = ID;
+  host.setAttribute('data-dsh-handoff', '1');
+  host.style.cssText = 'position:fixed;z-index:2147483647;left:50%;transform:translateX(-50%);bottom:24px;display:flex;gap:12px;align-items:center;padding:14px 18px;border-radius:12px;background:#111827;color:#f9fafb;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.35);max-width:min(90vw,720px)';
+  const label = document.createElement('span');
+  label.textContent = ${JSON.stringify(message)};
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = ${JSON.stringify(buttonLabel)};
+  button.style.cssText = 'flex:none;padding:8px 16px;border-radius:8px;border:0;background:#2563eb;color:#fff;font:inherit;cursor:pointer';
+  const stop = (value) => { host.remove(); resolve({ ok: true, resumed: value }); };
+  button.addEventListener('click', () => stop(true), { once: true });
+  host.appendChild(label);
+  host.appendChild(button);
+  (document.body || document.documentElement).appendChild(host);
+  window.__dshHandoff = stop;
+  setTimeout(() => { if (document.body && document.body.contains(host)) stop(false); }, 10 * 60 * 1000);
+}))()`
+}
+
 /** Focus an element and report whether it took focus. */
 export function focusScript({ ref, selector }) {
   return `(() => {

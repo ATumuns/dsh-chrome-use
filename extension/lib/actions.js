@@ -17,6 +17,9 @@ import {
   storageWriteScript,
   storageClearScript,
   waitScript,
+  markdownScript,
+  tableScript,
+  handoffScript,
 } from './page-scripts.js'
 
 const DEBUGGER_PAGE = /^(chrome|edge|about|devtools|chrome-extension|view-source):/i
@@ -106,6 +109,27 @@ export async function listTabs(params = {}) {
 }
 
 export async function openTab(params = {}) {
+  // `window: 'new'` puts the tab in a fresh browser window, `'background'` in a
+  // new window that never steals focus, `'current'` (the default) honours
+  // windowId or whatever window Chrome would pick.
+  if (params.window === 'new' || params.window === 'background') {
+    const created = await chrome.windows.create({
+      url: params.url,
+      focused: params.window === 'new' && params.focused === true,
+      ...(params.incognito === true ? { incognito: true } : {}),
+    })
+    const tabId = created.tabs?.[0]?.id
+    if (params.waitForLoad && typeof tabId === 'number') await waitForTabLoad(tabId, params.timeoutMs ?? 20000)
+    const fresh = typeof tabId === 'number' ? await chrome.tabs.get(tabId) : null
+    return {
+      tabId: fresh?.id ?? null,
+      windowId: created.id,
+      url: fresh?.url ?? params.url,
+      title: fresh?.title ?? '',
+      status: fresh?.status ?? 'loading',
+      window: params.window,
+    }
+  }
   const tab = await chrome.tabs.create({
     url: params.url,
     active: params.active !== false,
@@ -113,7 +137,63 @@ export async function openTab(params = {}) {
   })
   if (params.waitForLoad) await waitForTabLoad(tab.id, params.timeoutMs ?? 20000)
   const fresh = await chrome.tabs.get(tab.id)
-  return { tabId: fresh.id, windowId: fresh.windowId, url: fresh.url, title: fresh.title, status: fresh.status }
+  return { tabId: fresh.id, windowId: fresh.windowId, url: fresh.url, title: fresh.title, status: fresh.status, window: 'current' }
+}
+
+/**
+ * Open a separate window for automation and leave the desktop alone.
+ *
+ * `focused: false` is what keeps the user's foreground window where it is; the
+ * window still exists, is real, and can be driven by CDP, it just never takes
+ * the keyboard away. `state: 'minimized'` goes one step further on request.
+ */
+export async function openWindow(params = {}) {
+  const width = Number(params.width ?? 1280)
+  const height = Number(params.height ?? 800)
+  const created = await chrome.windows.create({
+    url: params.url,
+    focused: false,
+    type: 'normal',
+    width: Math.max(320, width),
+    height: Math.max(240, height),
+    ...(params.incognito === true ? { incognito: true } : {}),
+  })
+  const tabId = created.tabs?.[0]?.id
+  if (params.minimized === true) {
+    await chrome.windows.update(created.id, { state: 'minimized' })
+  }
+  if (params.waitForLoad && typeof tabId === 'number') await waitForTabLoad(tabId, params.timeoutMs ?? 20000)
+  const fresh = typeof tabId === 'number' ? await chrome.tabs.get(tabId).catch(() => null) : null
+  return {
+    windowId: created.id,
+    tabId: fresh?.id ?? null,
+    url: fresh?.url ?? params.url,
+    title: fresh?.title ?? '',
+    focused: false,
+    minimized: params.minimized === true,
+    incognito: params.incognito === true,
+  }
+}
+
+/** Raise or lower one automation window without touching the others. */
+export async function windowState(params = {}) {
+  const state = String(params.state ?? 'normal')
+  const allowed = ['normal', 'minimized', 'maximized', 'fullscreen']
+  if (!allowed.includes(state)) throw new Error(`state must be one of ${allowed.join(', ')}`)
+  const windowId = Number(params.windowId)
+  if (!Number.isFinite(windowId)) throw new Error('windowState needs a numeric windowId')
+  await chrome.windows.update(windowId, { focused: params.focused === true, state })
+  return { windowId, state, focused: params.focused === true }
+}
+
+/** Close one automation window and every tab in it. */
+export async function closeWindow(params = {}) {
+  const windowId = Number(params.windowId)
+  if (!Number.isFinite(windowId)) throw new Error('closeWindow needs a numeric windowId')
+  const remaining = await chrome.windows.getAll()
+  if (remaining.length <= 1) throw new Error('this is the last browser window; opening a replacement first avoids closing the browser')
+  await chrome.windows.remove(windowId)
+  return { closed: windowId }
 }
 
 async function waitForTabLoad(tabId, timeoutMs) {
@@ -259,6 +339,127 @@ export async function hover(params = {}) {
   const session = await sessionFor(tab.id)
   await session.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: rect.x, y: rect.y })
   return { tabId: tab.id, hovered: target.ref ?? target.selector }
+}
+
+/**
+ * Drag from one element to another.
+ *
+ * A synthetic drag has to look like a real one: a bare press-and-release is read
+ * as a click by every pointer-events implementation, so the button is held while
+ * the cursor walks to the target in small steps and the drag events fire between.
+ */
+export async function drag(params = {}) {
+  const tab = await resolveTab(params)
+  const from = { ref: params.ref, selector: params.selector }
+  const to = { ref: params.toRef, selector: params.toSelector }
+  if (!from.ref && !from.selector) throw new Error('drag needs a ref or a css selector to pick up')
+  if (!to.ref && !to.selector) throw new Error('drag needs toRef or toSelector to know where to drop')
+  const source = await evaluate(tab.id, rectScript(from))
+  if (!source?.ok) throw new Error(source?.error ?? 'drag source not found')
+  const destination = await evaluate(tab.id, rectScript(to))
+  if (!destination?.ok) throw new Error(destination?.error ?? 'drop target not found')
+  const session = await sessionFor(tab.id)
+  const steps = 12
+  await session.send('Input.dispatchMouseEvent', {
+    type: 'mousePressed',
+    x: source.x,
+    y: source.y,
+    button: 'left',
+    clickCount: 1,
+    buttons: 1,
+  })
+  for (let step = 1; step <= steps; step += 1) {
+    const ratio = step / steps
+    await session.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: source.x + (destination.x - source.x) * ratio,
+      y: source.y + (destination.y - source.y) * ratio,
+      button: 'left',
+      buttons: 1,
+    })
+  }
+  await session.send('Input.dispatchMouseEvent', {
+    type: 'mouseReleased',
+    x: destination.x,
+    y: destination.y,
+    button: 'left',
+    clickCount: 1,
+    buttons: 0,
+  })
+  return {
+    tabId: tab.id,
+    dragged: from.ref ?? from.selector,
+    onto: to.ref ?? to.selector,
+    distance: Math.round(Math.hypot(destination.x - source.x, destination.y - source.y)),
+  }
+}
+
+/**
+ * Fill several fields in one call.
+ *
+ * A form is usually filled field by field; each round trip costs a model step, so
+ * this accepts the whole list, focuses/clears/types each entry, and reports per
+ * field what happened instead of aborting on the first miss.
+ */
+export async function fill(params = {}) {
+  const tab = await resolveTab(params)
+  const fields = Array.isArray(params.fields) ? params.fields : []
+  if (fields.length === 0) throw new Error('fill needs at least one entry in fields')
+  const session = await sessionFor(tab.id)
+  const results = []
+  for (const field of fields) {
+    const target = { ref: field?.ref, selector: field?.selector }
+    if (!target.ref && !target.selector) {
+      results.push({ ok: false, error: 'entry has neither ref nor selector' })
+      continue
+    }
+    const label = target.ref ?? target.selector
+    const focused = await evaluate(tab.id, focusScript(target))
+    if (!focused?.ok) {
+      results.push({ target: label, ok: false, error: focused?.error ?? 'element not found' })
+      continue
+    }
+    const value = String(field?.text ?? field?.value ?? '')
+    if (field?.replace !== false) await evaluate(tab.id, clearScript(target))
+    if (field?.kind === 'select') {
+      const script = `(() => {
+        const el = ${target.ref ? `document.querySelector('[data-dsh-ref="${target.ref}"]')` : `document.querySelector(${JSON.stringify(target.selector)})`};
+        if (!el) return { ok: false, error: 'element not found' };
+        if (el.tagName !== 'SELECT') return { ok: false, error: 'element is ' + el.tagName.toLowerCase() + ', not select' };
+        const wanted = ${JSON.stringify(value.split('|').filter((part) => part !== ''))};
+        const chosen = [];
+        for (const option of el.options) {
+          const matched = wanted.some((want) => option.value === want || option.text.trim() === want);
+          option.selected = matched;
+          if (matched) chosen.push(option.value);
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, chosen };
+      })()`
+      const chosen = await evaluate(tab.id, script)
+      results.push(chosen?.ok ? { target: label, ok: true, chosen: chosen.chosen } : { target: label, ok: false, error: chosen?.error ?? 'select failed' })
+      continue
+    }
+    if (value) await session.send('Input.insertText', { text: value })
+    if (field?.submit) {
+      const sequence = sequenceFor('Enter')
+      for (const event of sequence) {
+        const outcome = await session.send('Input.dispatchKeyEvent', event, { releaseOnDialog: true })
+        if (outcome === ABANDONED) {
+          results.push({ target: label, ok: true, typed: value.length, dialogOpened: true })
+          return { tabId: tab.id, fields: results, dialog: session.dialog }
+        }
+      }
+    }
+    results.push({ target: label, ok: true, typed: value.length })
+  }
+  return {
+    tabId: tab.id,
+    filled: results.filter((entry) => entry.ok).length,
+    failed: results.filter((entry) => !entry.ok).length,
+    fields: results,
+  }
 }
 
 export async function type(params = {}) {
@@ -530,15 +731,125 @@ export async function emulateMedia(params = {}) {
   return { tabId: tab.id, media: params.media ?? null, features }
 }
 
+/**
+ * Slow the network down, or cut it, for one tab.
+ *
+ * `Network.emulateNetworkConditions` is the only way to make a page see a bad
+ * connection without touching the OS; clearing sends the "no throttling" shape
+ * rather than `Network.disable`, which would also drop the request observer.
+ */
+export async function emulateNetwork(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  if (params.clear === true) {
+    await session.send('Network.emulateNetworkConditions', {
+      offline: false,
+      latency: 0,
+      downloadThroughput: -1,
+      uploadThroughput: -1,
+    })
+    return { tabId: tab.id, cleared: true }
+  }
+  const preset = params.preset ?? null
+  const shaped = preset ? PRESETS[preset] : null
+  if (preset && !shaped) {
+    throw new Error(`unknown preset ${JSON.stringify(preset)}; use one of ${Object.keys(PRESETS).join(', ')} or pass latency/downloadKbps`)
+  }
+  const offline = params.offline === true
+  const latency = Number(params.latency ?? shaped?.latency ?? 0)
+  const download = Number(params.downloadKbps ?? shaped?.downloadKbps ?? -1)
+  const upload = Number(params.uploadKbps ?? shaped?.uploadKbps ?? -1)
+  await session.send('Network.emulateNetworkConditions', {
+    offline,
+    latency,
+    // CDP wants bytes per second; -1 means "leave it alone".
+    downloadThroughput: download < 0 ? -1 : Math.round((download * 1024) / 8),
+    uploadThroughput: upload < 0 ? -1 : Math.round((upload * 1024) / 8),
+    ...(params.connectionType ? { connectionType: String(params.connectionType) } : {}),
+  })
+  return { tabId: tab.id, offline, latency, downloadKbps: download, uploadKbps: upload, preset }
+}
+
+const PRESETS = {
+  offline: { latency: 0, downloadKbps: 0, uploadKbps: 0 },
+  slow3g: { latency: 400, downloadKbps: 400, uploadKbps: 400 },
+  fast3g: { latency: 150, downloadKbps: 1600, uploadKbps: 750 },
+  slow4g: { latency: 60, downloadKbps: 4000, uploadKbps: 3000 },
+}
+
+/** Put the page in a place, or clear the override. */
+export async function setGeolocation(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  if (params.clear === true) {
+    await session.send('Emulation.clearGeolocationOverride')
+    return { tabId: tab.id, cleared: true }
+  }
+  const latitude = Number(params.latitude)
+  const longitude = Number(params.longitude)
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    throw new Error('geolocation needs numeric latitude and longitude, or clear: true')
+  }
+  await session.send('Emulation.setGeolocationOverride', {
+    latitude,
+    longitude,
+    accuracy: Number(params.accuracy ?? 100),
+  })
+  return { tabId: tab.id, latitude, longitude, accuracy: Number(params.accuracy ?? 100) }
+}
+
+/** Put the page in a timezone, or clear the override. */
+export async function setTimezone(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  if (params.clear === true) {
+    await session.send('Emulation.setTimezoneOverride', { timezoneId: '' })
+    return { tabId: tab.id, cleared: true }
+  }
+  const timezone = String(params.timezone ?? '')
+  if (!timezone) throw new Error('timezone needs an IANA name such as Asia/Shanghai, or clear: true')
+  await session.send('Emulation.setTimezoneOverride', { timezoneId: timezone })
+  return { tabId: tab.id, timezone }
+}
+
 /* ------------------------------------------------------------- capture -- */
 
+/**
+ * Screenshot one element, or the whole page.
+ *
+ * The element path clips `captureBeyondViewport` to the element's box, which is
+ * how the model gets a legible picture of a chart or a table without a full-page
+ * image it cannot read.
+ */
 export async function screenshot(params = {}) {
   const tab = await resolveTab(params)
   const session = await sessionFor(tab.id)
   let data
   let width
   let height
-  if (params.fullPage) {
+  if (params.ref || params.selector) {
+    const box = await evaluate(tab.id, rectScript({ ref: params.ref, selector: params.selector }))
+    if (!box?.ok) throw new Error(box?.error ?? 'element not found')
+    const page = await session.send('Page.getLayoutMetrics')
+    const offsetX = page.cssLayoutViewport?.pageX ?? 0
+    const offsetY = page.cssLayoutViewport?.pageY ?? 0
+    // rectScript reports a viewport-relative box; the clip is page-relative.
+    width = Math.max(1, Math.ceil(box.width))
+    height = Math.max(1, Math.ceil(box.height))
+    const shot = await session.send('Page.captureScreenshot', {
+      format: params.format ?? 'png',
+      quality: params.format === 'jpeg' ? (params.quality ?? 80) : undefined,
+      captureBeyondViewport: true,
+      clip: {
+        x: Math.max(0, box.x - box.width / 2 + offsetX),
+        y: Math.max(0, box.y - box.height / 2 + offsetY),
+        width,
+        height,
+        scale: 1,
+      },
+    })
+    data = shot.data
+  } else if (params.fullPage) {
     const metrics = await session.send('Page.getLayoutMetrics')
     const size = metrics.cssContentSize ?? metrics.contentSize
     width = Math.min(Math.ceil(size.width), 8000)
@@ -580,6 +891,95 @@ export async function pdf(params = {}) {
 }
 
 /* ------------------------------------------------------------ inspection -- */
+
+/**
+ * The page as markdown.
+ *
+ * Snapshots cost a token per node; a model that only needs the prose, a table or
+ * a code block is better served by the main content converted once, with links
+ * and inline code preserved.
+ */
+export async function markdown(params = {}) {
+  const tab = await resolveTab(params)
+  const value = await evaluate(tab.id, markdownScript({ selector: params.selector ?? null, maxChars: params.maxChars ?? 20000 }))
+  if (!value?.ok) throw new Error(value?.error ?? 'could not read the page')
+  return {
+    tabId: tab.id,
+    url: value.url,
+    title: value.title,
+    truncated: value.truncated === true,
+    chars: value.chars,
+    markdown: value.markdown,
+  }
+}
+
+/** Every table on the page, as header + rows. */
+export async function tables(params = {}) {
+  const tab = await resolveTab(params)
+  const value = await evaluate(tab.id, tableScript({ selector: params.selector ?? null, maxTables: params.maxTables ?? 8, maxRows: params.maxRows ?? 200 }))
+  if (!value?.ok) throw new Error(value?.error ?? 'could not read the tables')
+  return { tabId: tab.id, url: value.url, count: value.count, tables: value.tables }
+}
+
+/**
+ * Performance counters for the tab: DOM size, layout, task time, JS heap.
+ *
+ * Numbers are raw CDP metrics; the ratios that usually matter (nodes, JS heap,
+ * cumulative layout shift) are surfaced first so a report does not need the
+ * whole table.
+ */
+export async function metrics(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  await session.send('Performance.enable').catch(() => {})
+  const result = await session.send('Performance.getMetrics')
+  const fields = new Map((result.metrics ?? []).map((entry) => [entry.name, entry.value]))
+  const pick = (name) => (fields.has(name) ? fields.get(name) : null)
+  const summary = {
+    nodes: pick('Nodes'),
+    documents: pick('Documents'),
+    jsHeapUsedBytes: pick('JSHeapUsedSize'),
+    jsHeapTotalBytes: pick('JSHeapTotalSize'),
+    layoutCount: pick('LayoutCount'),
+    recalcStyleCount: pick('RecalcStyleCount'),
+    scriptDurationMs: pick('ScriptDuration') === null ? null : Math.round(pick('ScriptDuration') * 1000),
+    layoutDurationMs: pick('LayoutDuration') === null ? null : Math.round(pick('LayoutDuration') * 1000),
+    taskDurationMs: pick('TaskDuration') === null ? null : Math.round(pick('TaskDuration') * 1000),
+    cumulativeLayoutShift: pick('CumulativeLayoutShift'),
+  }
+  if (params.clear) await session.send('Performance.disable').catch(() => {})
+  return { tabId: tab.id, summary, metrics: params.raw === true ? [...fields.entries()].map(([name, value]) => ({ name, value })) : undefined }
+}
+
+/**
+ * Hand the browser back to the person at the keyboard.
+ *
+ * Some steps — signing in, a payment confirmation, a captcha — must not be done
+ * by the agent. This paints a bar into the page, waits for the user to press
+ * Continue, and returns whether they resumed or the wait timed out.
+ */
+export async function handoff(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  const timeoutMs = Math.min(Math.max(Number(params.timeoutMs ?? 300000), 1000), 600000)
+  const script = handoffScript({
+    message: params.message ?? 'Take over in the browser, then press continue',
+    buttonLabel: params.buttonLabel ?? 'Continue',
+    timeoutMs,
+  })
+  const value = await session.send(
+    'Runtime.evaluate',
+    { expression: script, returnByValue: true, awaitPromise: true, userGesture: true },
+    { releaseOnDialog: true },
+  )
+  const payload = value?.result?.value
+  return {
+    tabId: tab.id,
+    url: tab.url,
+    resumed: payload?.resumed === true,
+    timedOut: payload?.resumed !== true,
+  }
+}
 
 export async function evaluateInPage(params = {}) {
   const tab = await resolveTab(params)
@@ -750,14 +1150,32 @@ export async function dispatch(method, params) {
       return closeTabs(params)
     case 'tabs.activate':
       return activateTab(params)
+    case 'tabs.window':
+      return openWindow(params)
+    case 'tabs.windowState':
+      return windowState(params)
+    case 'tabs.closeWindow':
+      return closeWindow(params)
     case 'page.navigate':
       return navigate(params)
     case 'page.history':
       return history(params)
     case 'page.snapshot':
       return snapshot(params)
+    case 'page.markdown':
+      return markdown(params)
+    case 'page.table':
+      return tables(params)
+    case 'page.metrics':
+      return metrics(params)
+    case 'page.handoff':
+      return handoff(params)
     case 'page.click':
       return click(params)
+    case 'page.drag':
+      return drag(params)
+    case 'page.fill':
+      return fill(params)
     case 'page.hover':
       return hover(params)
     case 'page.type':
@@ -784,6 +1202,12 @@ export async function dispatch(method, params) {
       return clearViewport(params)
     case 'page.emulateMedia':
       return emulateMedia(params)
+    case 'page.networkConditions':
+      return emulateNetwork(params)
+    case 'page.geolocation':
+      return setGeolocation(params)
+    case 'page.timezone':
+      return setTimezone(params)
     case 'page.screenshot':
       return screenshot(params)
     case 'page.pdf':
