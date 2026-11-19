@@ -20,9 +20,13 @@ import {
   markdownScript,
   tableScript,
   handoffScript,
+  timezoneScript,
 } from './page-scripts.js'
 
 const DEBUGGER_PAGE = /^(chrome|edge|about|devtools|chrome-extension|view-source):/i
+
+/** Start-up scripts installed per tab, so a stale one can be removed before replacing it. */
+const timezoneIds = new Map()
 
 /** Refuse targets where CDP cannot work, with a message that says why. */
 function assertDebuggable(tab) {
@@ -182,7 +186,12 @@ export async function windowState(params = {}) {
   if (!allowed.includes(state)) throw new Error(`state must be one of ${allowed.join(', ')}`)
   const windowId = Number(params.windowId)
   if (!Number.isFinite(windowId)) throw new Error('windowState needs a numeric windowId')
-  await chrome.windows.update(windowId, { focused: params.focused === true, state })
+  // Chrome rejects the whole call with "Invalid value for state" when `focused: false`
+  // travels next to a state, so the flag is only sent when it actually asks for focus.
+  // Leaving it out keeps the same outcome: the window changes without taking the desktop.
+  const patch = { state }
+  if (params.focused === true) patch.focused = true
+  await chrome.windows.update(windowId, patch)
   return { windowId, state, focused: params.focused === true }
 }
 
@@ -348,6 +357,85 @@ export async function hover(params = {}) {
  * as a click by every pointer-events implementation, so the button is held while
  * the cursor walks to the target in small steps and the drag events fire between.
  */
+/**
+ * Dispatch one input event out of band, with a deadline.
+ *
+ * Two things make a naive `await` wrong here. A pressed button changes how Chrome
+ * acknowledges input: the browser process can withhold the ack until the gesture
+ * finishes, so awaiting every intermediate move deadlocks the gesture itself. And
+ * the pressed-button flag lives in the browser process, not in one tab, so a press
+ * whose ack never arrived makes every later click in every tab vanish.
+ *
+ * So each event gets its own deadline and reports `stalled` instead of throwing,
+ * leaving the caller free to finish the gesture and then reset the input state.
+ */
+async function sendInputOutOfBand(session, event, timeoutMs = 5000) {
+  const started = Date.now()
+  let timer
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('stalled'), timeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+  })
+  let outcome = 'stalled'
+  try {
+    outcome = await Promise.race([
+      session.sendImmediate('Input.dispatchMouseEvent', event).then(() => 'sent'),
+      deadline,
+    ])
+  } catch {
+    outcome = 'failed'
+  } finally {
+    clearTimeout(timer)
+  }
+  return { outcome, ms: Date.now() - started }
+}
+
+/** Await a promise, but give up at the deadline instead of holding the queue. */
+async function withinDeadline(promise, timeoutMs, fallback) {
+  let timer
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(fallback), timeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+  })
+  try {
+    return await Promise.race([promise.catch(() => fallback), deadline])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * Put the browser's input state back to neutral.
+ *
+ * The pressed-button flag is process-wide: if a drag stalls after its press, every
+ * click in every tab is silently swallowed — pages still receive moves, nothing
+ * receives a press. `Input.cancelDragging` and an out-of-bounds release are what
+ * clears it, so this is also the recovery step a stuck session needs.
+ */
+export async function resetInput(params = {}) {
+  const tab = await resolveTab(params)
+  const session = await sessionFor(tab.id)
+  const cancelled = await withinDeadline(
+    session.sendImmediate('Input.cancelDragging', {}).then(() => true),
+    2000,
+    false,
+  )
+  // A release at (0,0) is rejected as out of bounds on some pages, and a rejected
+  // release leaves the flag set, so aim at the middle of the live viewport.
+  const centre = await evaluate(
+    tab.id,
+    '({ x: Math.round(innerWidth / 2) || 1, y: Math.round(innerHeight / 2) || 1 })',
+  ).catch(() => null)
+  const x = Number(centre?.x) > 0 ? centre.x : 20
+  const y = Number(centre?.y) > 0 ? centre.y : 20
+  const release = await sendInputOutOfBand(
+    session,
+    { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 },
+    4000,
+  )
+  return { tabId: tab.id, cancelled, released: release.outcome === 'sent' }
+}
+
 export async function drag(params = {}) {
   const tab = await resolveTab(params)
   const from = { ref: params.ref, selector: params.selector }
@@ -359,38 +447,77 @@ export async function drag(params = {}) {
   const destination = await evaluate(tab.id, rectScript(to))
   if (!destination?.ok) throw new Error(destination?.error ?? 'drop target not found')
   const session = await sessionFor(tab.id)
-  const steps = 12
-  await session.send('Input.dispatchMouseEvent', {
-    type: 'mousePressed',
-    x: source.x,
-    y: source.y,
-    button: 'left',
-    clickCount: 1,
-    buttons: 1,
-  })
+  const steps = Math.max(1, Math.min(48, params.steps ?? 12))
+  const stepMs = params.stepMs ?? 0
+  const timings = []
+
+  const press = await sendInputOutOfBand(
+    session,
+    {
+      type: 'mousePressed',
+      x: source.x,
+      y: source.y,
+      button: 'left',
+      clickCount: 1,
+      buttons: 1,
+    },
+    2000,
+  )
+  timings.push(`press ${press.outcome} in ${press.ms}ms`)
+
+  // The moves are fired together and not awaited one by one: their positions are
+  // what the page reads, and one ack withheld until the drop would stall the whole
+  // gesture before it ever reaches the release.
+  const moves = []
   for (let step = 1; step <= steps; step += 1) {
     const ratio = step / steps
-    await session.send('Input.dispatchMouseEvent', {
-      type: 'mouseMoved',
-      x: source.x + (destination.x - source.x) * ratio,
-      y: source.y + (destination.y - source.y) * ratio,
-      button: 'left',
-      buttons: 1,
-    })
+    moves.push(
+      session
+        .sendImmediate('Input.dispatchMouseEvent', {
+          type: 'mouseMoved',
+          x: Math.round(source.x + (destination.x - source.x) * ratio),
+          y: Math.round(source.y + (destination.y - source.y) * ratio),
+          button: 'left',
+          buttons: 1,
+        })
+        .catch(() => {}),
+    )
+    if (stepMs > 0) await new Promise((resolve) => setTimeout(resolve, stepMs))
   }
-  await session.send('Input.dispatchMouseEvent', {
-    type: 'mouseReleased',
-    x: destination.x,
-    y: destination.y,
-    button: 'left',
-    clickCount: 1,
-    buttons: 0,
-  })
+  const release = await sendInputOutOfBand(
+    session,
+    {
+      type: 'mouseReleased',
+      x: destination.x,
+      y: destination.y,
+      button: 'left',
+      clickCount: 1,
+      buttons: 0,
+    },
+    8000,
+  )
+  timings.push(`release ${release.outcome} in ${release.ms}ms`)
+  await withinDeadline(Promise.all(moves), 3000, null)
+
+  if (release.outcome !== 'sent') {
+    // Leaving the button down would swallow every later click in every tab, so the
+    // reset is not optional; the gesture itself may still have started on the page.
+    const reset = await resetInput({ tabId: tab.id }).catch(() => null)
+    throw new Error(
+      `the page held the drop. ${timings.join('; ')}; reset ${
+        reset?.released ? 'released the pointer' : 'could not confirm a release'
+      }. The drag may still have started, so look at the page before retrying`,
+    )
+  }
   return {
     tabId: tab.id,
     dragged: from.ref ?? from.selector,
     onto: to.ref ?? to.selector,
     distance: Math.round(Math.hypot(destination.x - source.x, destination.y - source.y)),
+    steps,
+    dropped: true,
+    timings,
+    ...(press.outcome === 'sent' ? {} : { note: 'the press ack arrived late; the gesture still completed' }),
   }
 }
 
@@ -414,6 +541,40 @@ export async function fill(params = {}) {
       continue
     }
     const label = target.ref ?? target.selector
+    const probe = `(() => {
+      const el = ${target.ref ? `document.querySelector('[data-dsh-ref="${target.ref}"]')` : `document.querySelector(${JSON.stringify(target.selector)})`};
+      if (!el) return { ok: false, error: 'element not found' };
+      const tag = el.tagName.toLowerCase();
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      const readOnly = el.readOnly === true || el.getAttribute('readonly') !== null || el.disabled === true;
+      return { ok: true, tag, type, readOnly, editable: el.isContentEditable === true };
+    })()`
+    const shape = await evaluate(tab.id, probe)
+    if (!shape?.ok) {
+      results.push({ target: label, ok: false, error: shape?.error ?? 'element not found' })
+      continue
+    }
+    if (shape.readOnly) {
+      results.push({ target: label, ok: false, error: 'element is read-only or disabled' })
+      continue
+    }
+    // Typing into a file input or a checkbox does nothing useful, and because the
+    // keystrokes go wherever focus is, it silently lands in the previous field.
+    if (shape.tag === 'input' && (shape.type === 'file' || shape.type === 'checkbox' || shape.type === 'radio' || shape.type === 'submit' || shape.type === 'button')) {
+      results.push({
+        target: label,
+        ok: false,
+        error:
+          shape.type === 'file'
+            ? 'a file input takes paths, not text: use chrome_use_interact action upload'
+            : `an input of type ${shape.type} has no text to type`,
+      })
+      continue
+    }
+    if (shape.tag === 'select' && field?.kind !== 'select') {
+      results.push({ target: label, ok: false, error: 'this is a select: use kind "select"' })
+      continue
+    }
     const focused = await evaluate(tab.id, focusScript(target))
     if (!focused?.ok) {
       results.push({ target: label, ok: false, error: focused?.error ?? 'element not found' })
@@ -790,26 +951,68 @@ export async function setGeolocation(params = {}) {
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
     throw new Error('geolocation needs numeric latitude and longitude, or clear: true')
   }
-  await session.send('Emulation.setGeolocationOverride', {
-    latitude,
-    longitude,
-    accuracy: Number(params.accuracy ?? 100),
-  })
-  return { tabId: tab.id, latitude, longitude, accuracy: Number(params.accuracy ?? 100) }
+  const accuracy = Number(params.accuracy ?? 100)
+  // Overriding the position is not the same as being allowed to ask for it: with no
+  // grant, `getCurrentPosition` sits on the permission prompt until it times out, so
+  // the override would look broken. Grant for this origin only, and say if it failed.
+  let granted = false
+  let grantError = null
+  const origin = (() => {
+    try {
+      return new URL(tab.url ?? '').origin
+    } catch {
+      return null
+    }
+  })()
+  if (origin && origin !== 'null') {
+    // The Browser domain is only reachable on a browser-level session, so granting
+    // there fails from a tab-scoped debugger attach. The extension permission API is
+    // the route that actually works here: it stores a real site setting, and CDP's
+    // geolocation override then answers queries made under that grant. The content
+    // setting for a position is named `location`, not `geolocation`.
+    try {
+      await chrome.contentSettings.location.set({
+        primaryPattern: `${origin}/*`,
+        setting: 'allow',
+        scope: 'regular',
+      })
+      granted = true
+    } catch (error) {
+      grantError = error instanceof Error ? error.message : String(error)
+    }
+  } else {
+    grantError = 'the tab has no http(s) origin to grant geolocation for'
+  }
+  await session.send('Emulation.setGeolocationOverride', { latitude, longitude, accuracy })
+  return { tabId: tab.id, latitude, longitude, accuracy, granted, ...(grantError ? { grantError } : {}) }
 }
 
 /** Put the page in a timezone, or clear the override. */
 export async function setTimezone(params = {}) {
   const tab = await resolveTab(params)
   const session = await sessionFor(tab.id)
-  if (params.clear === true) {
-    await session.send('Emulation.setTimezoneOverride', { timezoneId: '' })
-    return { tabId: tab.id, cleared: true }
+  const timezone = params.clear === true ? '' : String(params.timezone ?? '')
+  if (params.clear !== true && !timezone) {
+    throw new Error('timezone needs an IANA name such as Asia/Shanghai, or clear: true')
   }
-  const timezone = String(params.timezone ?? '')
-  if (!timezone) throw new Error('timezone needs an IANA name such as Asia/Shanghai, or clear: true')
-  await session.send('Emulation.setTimezoneOverride', { timezoneId: timezone })
-  return { tabId: tab.id, timezone }
+  // Chrome only honours `Emulation.setTimezoneOverride` for trusted clients, so the
+  // zone is imposed inside the page. The same source is installed as a start-up
+  // script, otherwise the next navigation silently drops back to the real zone.
+  const source = timezoneScript({ timeZone: timezone })
+  const key = `dsh-timezone:${tab.id}`
+  const previous = timezoneIds.get(key)
+  if (previous) {
+    await session.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: previous }).catch(() => {})
+    timezoneIds.delete(key)
+  }
+  const result = await evaluate(tab.id, source)
+  if (!result?.ok) throw new Error(result?.error ?? `could not install the ${timezone} timezone`)
+  if (timezone) {
+    const installed = await session.send('Page.addScriptToEvaluateOnNewDocument', { source })
+    if (installed?.identifier) timezoneIds.set(key, installed.identifier)
+  }
+  if (params.clear === true) return { tabId: tab.id, cleared: true }
+  return { tabId: tab.id, timezone, offsetMinutes: result.offsetMinutes, applied: 'page' }
 }
 
 /* ------------------------------------------------------------- capture -- */
@@ -1174,6 +1377,8 @@ export async function dispatch(method, params) {
       return click(params)
     case 'page.drag':
       return drag(params)
+    case 'page.resetInput':
+      return resetInput(params)
     case 'page.fill':
       return fill(params)
     case 'page.hover':

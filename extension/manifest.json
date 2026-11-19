@@ -19,7 +19,9 @@
     "history",
     "webNavigation",
     "alarms",
-    "notifications"
+    "notifications",
+    "contentSettings",
+    "geolocation"
   ],
   "host_permissions": [
     "<all_urls>"

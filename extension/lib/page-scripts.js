@@ -626,3 +626,172 @@ function resolveEntry({ ref, selector }) {
   }
   return `(() => ({ el: document.querySelector(${JSON.stringify(selector)}), dx: 0, dy: 0 }))()`
 }
+
+/**
+ * Make the page believe it lives in another timezone.
+ *
+ * Chrome refuses `Emulation.setTimezoneOverride` to extension debugger clients
+ * ("Timezone override is only available to trusted clients"), so the zone is
+ * imposed from inside the page instead: `Date` and `Intl` are wrapped to report
+ * the requested zone. The wrapper is reversible, and the caller re-installs it
+ * with `Page.addScriptToEvaluateOnNewDocument` so it survives navigation.
+ */
+export function timezoneScript({ timeZone }) {
+  if (!timeZone) {
+    return `(() => {
+  const installed = window.__dshTimezone;
+  if (!installed || typeof installed.restore !== 'function') return { ok: true, timeZone: null, restored: false };
+  installed.restore();
+  return { ok: true, timeZone: null, restored: true };
+})()`
+  }
+  return `(() => {
+  const TZ = ${JSON.stringify(timeZone)};
+  const VERSION = 2;
+  const previous = window.__dshTimezone;
+  if (previous && previous.timeZone === TZ && previous.version === VERSION) {
+    return { ok: true, timeZone: TZ, installed: false };
+  }
+  if (previous && typeof previous.restore === 'function') previous.restore();
+
+  const RealDate = Date;
+  const RealDTF = Intl.DateTimeFormat;
+  const proto = RealDate.prototype;
+  const saved = {
+    getTimezoneOffset: proto.getTimezoneOffset,
+    toString: proto.toString,
+    toTimeString: proto.toTimeString,
+    toDateString: proto.toDateString,
+    toLocaleString: proto.toLocaleString,
+    toLocaleDateString: proto.toLocaleDateString,
+    toLocaleTimeString: proto.toLocaleTimeString,
+    resolvedOptions: RealDTF.prototype.resolvedOptions,
+    dateTimeFormat: Intl.DateTimeFormat,
+  };
+
+  let formatter;
+  try {
+    formatter = new RealDTF('en-US', {
+      timeZone: TZ, hour12: false, weekday: 'short', year: 'numeric', month: 'short',
+      day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  } catch (error) {
+    return { ok: false, error: 'unknown timezone ' + TZ + ': ' + (error && error.message) };
+  }
+
+  const wall = (ms) => {
+    const parts = formatter.formatToParts(new RealDate(ms));
+    const pick = (type) => {
+      for (const part of parts) if (part.type === type) return part.value;
+      return '';
+    };
+    return {
+      weekday: pick('weekday'), year: pick('year'), month: pick('month'), day: pick('day'),
+      hour: Number(pick('hour')) % 24, minute: pick('minute'), second: pick('second'),
+    };
+  };
+
+  const pad = (value) => String(value).padStart(2, '0');
+
+  // Minutes to add to UTC to reach local time (the opposite sign of getTimezoneOffset).
+  const shiftAt = (ms) => {
+    const at = wall(ms);
+    const asUTC = RealDate.UTC(Number(at.year), monthIndex(at.month), Number(at.day), at.hour, Number(at.minute), Number(at.second));
+    return Math.round((asUTC - ms) / 60000);
+  };
+
+  function monthIndex(name) {
+    const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const index = names.indexOf(String(name).slice(0, 3));
+    return index < 0 ? 0 : index;
+  }
+
+  const stamp = (ms) => {
+    const at = wall(ms);
+    const shift = shiftAt(ms);
+    const sign = shift < 0 ? '-' : '+';
+    const zone = sign + pad(Math.floor(Math.abs(shift) / 60)) + pad(Math.abs(shift) % 60);
+    return {
+      date: at.weekday + ' ' + at.month + ' ' + at.day + ' ' + at.year,
+      time: pad(at.hour) + ':' + at.minute + ':' + at.second + ' GMT' + zone + ' (' + TZ + ')',
+    };
+  };
+
+  proto.getTimezoneOffset = function getTimezoneOffset() { return -shiftAt(this.getTime()); };
+  proto.toString = function toString() {
+    const at = stamp(this.getTime());
+    return at.date + ' ' + at.time;
+  };
+  proto.toTimeString = function toTimeString() { return stamp(this.getTime()).time; };
+  proto.toDateString = function toDateString() { return stamp(this.getTime()).date; };
+
+  // toLocaleString(locales, options) takes its options last, so appending a zone
+  // must not displace the locale argument: pick the trailing object, if any.
+  const withZone = (args) => {
+    const copy = Array.prototype.slice.call(args);
+    let index = -1;
+    for (let i = copy.length - 1; i >= 0; i -= 1) {
+      const candidate = copy[i];
+      if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) { index = i; break }
+      if (typeof candidate === 'string') break;
+    }
+    if (index >= 0) {
+      if (copy[index].timeZone) return copy;
+      copy[index] = { ...copy[index], timeZone: TZ };
+      return copy;
+    }
+    copy.push({ timeZone: TZ });
+    return copy;
+  };
+  proto.toLocaleString = function toLocaleString(...args) {
+    return saved.toLocaleString.apply(this, withZone(args));
+  };
+  proto.toLocaleDateString = function toLocaleDateString(...args) {
+    return saved.toLocaleDateString.apply(this, withZone(args));
+  };
+  proto.toLocaleTimeString = function toLocaleTimeString(...args) {
+    return saved.toLocaleTimeString.apply(this, withZone(args));
+  };
+
+  const seen = new WeakMap();
+  const PatchedDTF = new Proxy(RealDTF, {
+    construct(target, args, newTarget) {
+      const options = args[1];
+      const instance = Reflect.construct(target, args, newTarget);
+      seen.set(instance, Boolean(options && typeof options === 'object' && options.timeZone));
+      return instance;
+    },
+    apply(target, thisArg, args) {
+      const options = args[1];
+      const instance = Reflect.apply(target, thisArg, args);
+      seen.set(instance, Boolean(options && typeof options === 'object' && options.timeZone));
+      return instance;
+    },
+  });
+  RealDTF.prototype.resolvedOptions = function resolvedOptions() {
+    const out = saved.resolvedOptions.call(this);
+    if (seen.get(this) !== true) out.timeZone = TZ;
+    return out;
+  };
+  Intl.DateTimeFormat = PatchedDTF;
+
+  window.__dshTimezone = {
+    timeZone: TZ,
+    version: VERSION,
+    offsetMinutes: shiftAt(RealDate.now()),
+    restore() {
+      proto.getTimezoneOffset = saved.getTimezoneOffset;
+      proto.toString = saved.toString;
+      proto.toTimeString = saved.toTimeString;
+      proto.toDateString = saved.toDateString;
+      proto.toLocaleString = saved.toLocaleString;
+      proto.toLocaleDateString = saved.toLocaleDateString;
+      proto.toLocaleTimeString = saved.toLocaleTimeString;
+      RealDTF.prototype.resolvedOptions = saved.resolvedOptions;
+      Intl.DateTimeFormat = saved.dateTimeFormat;
+      if (window.__dshTimezone && window.__dshTimezone.timeZone === TZ) delete window.__dshTimezone;
+    },
+  };
+  return { ok: true, timeZone: TZ, installed: true, offsetMinutes: shiftAt(RealDate.now()) };
+})()`
+}

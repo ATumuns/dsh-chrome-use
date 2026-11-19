@@ -174,8 +174,10 @@ try {
   check('page.geolocation sets coordinates', geoParams?.latitude === 31.2 && geoParams?.longitude === 121.5, JSON.stringify(geo))
 
   const tz = await run('page.timezone', { timezone: 'Asia/Shanghai' })
-  const tzParams = sent.find((entry) => entry.method === 'Emulation.setTimezoneOverride')?.params
-  check('page.timezone sets a zone', tzParams?.timezoneId === 'Asia/Shanghai', JSON.stringify(tz))
+  // Chrome refuses `Emulation.setTimezoneOverride` to extension clients, so the zone
+  // is imposed from inside the page and re-installed on every navigation.
+  const tzPinned = sent.some((entry) => entry.method === 'Page.addScriptToEvaluateOnNewDocument')
+  check('page.timezone installs a page-level shim', tz.applied === 'page' && tzPinned, JSON.stringify(tz))
 
   const md = await run('page.markdown', { maxChars: 100 })
   check('page.markdown returns markdown', typeof md.markdown === 'string' && md.url, JSON.stringify(md))

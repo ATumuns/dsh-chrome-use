@@ -141,9 +141,11 @@ Edge 走 `edge://extensions`，步骤一样。
 
 ## 扩展权限
 
-manifest 申请了 `debugger`、`tabs`、`tabGroups`、`scripting`、`storage`、`cookies`、`downloads`、`history`、`webNavigation`、`alarms`、`notifications` 和 `<all_urls>`。
+manifest 申请了 `debugger`、`tabs`、`tabGroups`、`scripting`、`storage`、`cookies`、`downloads`、`history`、`webNavigation`、`alarms`、`notifications`、`contentSettings`、`geolocation` 和 `<all_urls>`。
 
 `debugger` 是核心：没有它就没有 CDP，也就没有真实输入事件、网络缓冲、截图。装的时候 Chrome 会顶一条「调试此浏览器」的警告条——这是 CDP 的固有代价，Codex 的扩展同样如此。
+
+`contentSettings` + `geolocation` 只服务于 `action geolocation`：单靠 `Emulation.setGeolocationOverride` 权限会停在 `prompt`，`getCurrentPosition` 直接超时。所以先按站点写一条 `chrome.contentSettings.location`（类型名是 `location`，不是 `geolocation`）的 `allow`，再下坐标覆盖。`Browser.setPermission` 走不通——Browser 域只在 browser 级会话可用，标签页级会话发不出去。
 
 ## 安全模型
 
@@ -197,12 +199,12 @@ dsh-chrome-use/
 │   ├── manifest.json MV3
 │   ├── background.js 拨出、重连、命令分发
 │   ├── lib/cdp.js    debugger 会话、控制台/网络环形缓冲、对话框看门狗
-│   ├── lib/actions.js 方法实现
+│   ├── lib/actions.js 方法实现（含窗口、拖放、模拟、抽取）
 │   ├── lib/page-scripts.js 页面内 IIFE（快照/定位/存储/等待）
 │   ├── popup.*       状态与开关
 │   └── options.*     桥接地址、令牌、标签
 ├── locale/           插件卡片文案
-├── test/             协议层、设置、契约、对话框测试
+├── test/             协议层、设置、契约、对话框、动作接缝测试
 └── scripts/          图标生成
 ```
 
@@ -213,6 +215,9 @@ dsh-chrome-use/
 - 一个 DSH 可以连多个浏览器（多台机器、多个 profile），工具参数 `browser` 按 id 或标签选。
 - 控制台和网络缓冲是按标签页的环形缓冲，上限 400 / 300 条，读了就清不掉的会覆盖最旧的。
 - PDF 用 `Page.printToPDF`，无头和有头行为在部分站点上不同。
+- `action drag` 的中间移动是**并发发出、不等 ack** 的：按下之后浏览器进程会扣住后续事件的应答直到手势结束，逐条等待必然死锁。代价是 `drag` 只保证按下与抬起被确认，中间轨迹的具体落点由页面决定；发完拖放后建议用快照或 `action markdown` 核对结果。如果一次 drag 中途卡住，按压标志会污染整个浏览器进程（所有标签页的点击都会被静默吞掉），`action reset` 用 `Input.cancelDragging` + 视口中心释放来复位——注意 `(0,0)` 的释放会被 Chrome 判越界而拒绝。
+- `action timezone` 用的是页面级 shim，不是 CDP 的时区覆盖（`Emulation.setTimezoneOverride` 对扩展客户端返回 `Timezone override is only available to trusted clients`）。它对 `Date` 与 `Intl.DateTimeFormat` 生效，但改不了 `Date.now()` 之外的时间源，也拦不住已经缓存了时区的第三方库。
+- `action windowState` 只在 `focused: true` 时才把 `focused` 字段发给 `chrome.windows.update`——同时传 `focused: false` 和 `state` 会被 Chrome 整个拒绝（`Invalid value for state`）。
 - 队列是**按标签页**串行的。同一个标签页上的命令互相排队（否则对话框、导航、点击会互相踩），不同标签页之间天然并行。
 - 跨源 iframe 只报出 `src`，不进去。要操作它就在独立标签页打开——`chrome.debugger` 是按标签页 attach 的，跨源 frame 的坐标系也不属于当前文档。
 - 独立子窗口里的标签页和普通标签页一样受「按标签页串行」约束；窗口本身不抢焦点，但它里面的页面仍然可能弹系统级对话框（下载、权限），这些只能由用户在本机点。

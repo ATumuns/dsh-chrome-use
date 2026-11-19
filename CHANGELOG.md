@@ -35,6 +35,14 @@
 - 扩展曾在宿主断开后永不重连（把 close code 1000 当正常断开），并可能在拨号无响应时永久卡在 `connecting`。
 - JS 对话框会锁死按标签页的命令队列；现在回答对话框走旁路队列，并区分「事件没送到」与「确实被弹窗挡住」。
 
+### 修正（v1.0.0 实测阶段追加）
+
+- `windowState` 传 `focused: false` 与 `state` 会被 Chrome 整体拒绝（`Invalid value for state`）；改为只在真要聚焦时才带 `focused` 字段。
+- `drag` 逐条等待中间的 `mouseMoved` 会死锁：按下后浏览器进程扣住 ack 直到手势结束。而且按压标志是进程级的，一次卡住的 press 会让所有标签页的点击被静默吞掉。改为并发发出中间移动、旁路释放、`Input.cancelDragging` 兜底，并在卡住时主动复位指针。
+- `fill` 增加逐字段前置校验：坏选择器不再把文本送进上一个焦点字段，文件输入、只读控件、checkbox/radio、select 都会给出具体原因。
+- `geolocation` 需要 `chrome.contentSettings.location`（类型名是 `location`，不是 `geolocation`）配合 `Emulation.setGeolocationOverride`，否则权限停在 `prompt`。
+- `timezone` 的 `Emulation.setTimezoneOverride` 对扩展客户端不可用（`Timezone override is only available to trusted clients`）；改为页面级 shim + `Page.addScriptToEvaluateOnNewDocument`，跨导航存活。
+
 ### 已知边界
 
 - 只能驱动 Chromium 系浏览器。
