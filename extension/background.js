@@ -248,7 +248,12 @@ async function connect({ manual = false } = {}) {
     attempt = await dial(retry, settings)
     if (attempt.opened) {
       setStatus('connected', 'moved to the fixed bridge port')
+      return
     }
+    // The retry failed as well, which means DSH is not listening on the fixed
+    // port yet. Nothing opened here, so no close event will ever ask for a
+    // retry; without this the extension would sit dead until the next alarm.
+    if (!stoppedByUser) void scheduleReconnect()
   })().finally(() => {
     connecting = null
   })
