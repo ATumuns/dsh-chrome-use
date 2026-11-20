@@ -124,6 +124,64 @@ for (const tool of definitions) {
 // The harness rejects tool names reserved by the PTC presentation transport.
 check('no tool claims the reserved name run_code', !definitions.some((tool) => tool.name === 'run_code'))
 
+// --- dialog answer field ----------------------------------------------------
+//
+// Chrome's Page.handleJavaScriptDialog names the answer `promptText`. `text` is
+// the `type` action's field, so action dialog must refuse it loudly instead of
+// dropping it and leaving the prompt empty.
+
+const sentCalls = []
+const answeringBridge = {
+  list: () => [],
+  describe: () => ({ clients: [] }),
+  require: () => ({
+    call: async (method, params) => {
+      sentCalls.push({ method, params })
+      return { tabId: 1, accepted: true, type: 'prompt', message: '' }
+    },
+  }),
+}
+const interact = createTools({
+  bridge: answeringBridge,
+  token: () => 'test-token',
+  rotateToken: () => 'test-token',
+  endpoint: 'ws://127.0.0.1:0/dsh-chrome-use/bridge',
+  ctx,
+  log: { info() {}, warn() {}, error() {} },
+}).find((tool) => tool.name === 'chrome_use_interact')
+
+const dialogSchema = interact.parameters.properties
+check('action dialog documents promptText as its answer field', /promptText/.test(dialogSchema.promptText?.description ?? ''))
+check(
+  'the text field points dialog answers at promptText',
+  /promptText/.test(dialogSchema.text?.description ?? ''),
+  dialogSchema.text?.description,
+)
+
+await interact.execute({ action: 'dialog', accept: true, promptText: 'DSH' }, {})
+check(
+  'action dialog forwards promptText to Chrome',
+  sentCalls.at(-1)?.params?.promptText === 'DSH',
+  JSON.stringify(sentCalls.at(-1)?.params),
+)
+
+let refusedText = null
+try {
+  await interact.execute({ action: 'dialog', accept: true, text: 'DSH' }, {})
+} catch (error) {
+  refusedText = error
+}
+check(
+  'action dialog refuses the type field instead of ignoring it',
+  refusedText !== null && /promptText/.test(String(refusedText)),
+  refusedText === null ? 'it was accepted silently' : String(refusedText),
+)
+check(
+  'the refusal leaves the prompt unanswered',
+  sentCalls.at(-1)?.params?.promptText === 'DSH',
+  JSON.stringify(sentCalls.at(-1)?.params),
+)
+
 process.stdout.write(`\n${checks - failures}/${checks} checks passed\n`)
 if (failures > 0) process.exitCode = 1
 else process.stdout.write('tool-contract: all checks passed\n')

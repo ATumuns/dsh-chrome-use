@@ -49,6 +49,8 @@ check('absent config is the documented default', () => {
     readOnly: false,
     allowEvaluation: true,
     disabledTools: [],
+    port: 8971,
+    host: '127.0.0.1',
   })
 })
 

@@ -31,7 +31,7 @@ const MAX_BACKOFF_MS = 30_000
  * only reliable way to tell a freshly reloaded extension from one still running
  * yesterday's code — an automatic reconnect looks identical to a reload.
  */
-const BUILD = '2026-11-19.2'
+const BUILD = '2026-11-20.1'
 
 /** @type {WebSocket | null} */
 let socket = null
@@ -51,7 +51,11 @@ let stoppedByUser = false
 let lastStatus = { state: 'idle', detail: 'not connected', since: Date.now() }
 
 const DEFAULTS = {
-  bridgeUrl: 'ws://127.0.0.1:57232/dsh-chrome-use/bridge',
+  // The plugin owns a fixed loopback port, so this address survives a DSH
+  // restart. It used to point at the host web server, whose port is
+  // OS-assigned and therefore changed on every start — the extension then sat
+  // on a stale URL until the user pasted a new one.
+  bridgeUrl: 'ws://127.0.0.1:8971/dsh-chrome-use/bridge',
   token: '',
   autoConnect: true,
   agentLabel: 'chrome',
@@ -108,6 +112,93 @@ function endpointFor(settings) {
   return url.toString()
 }
 
+/**
+ * Whether a stored address predates the fixed port.
+ *
+ * The bridge used to live on the DSH web server, whose port the OS assigns, so
+ * every install from before 1.0.2 holds an address that stopped resolving the
+ * first time DSH restarted. Rather than make the user notice and retype it,
+ * a failed dial on a non-default address retries the default once and keeps it.
+ */
+function isStaleAddress(url) {
+  if (url === DEFAULTS.bridgeUrl) return false
+  try {
+    const parsed = new URL(url)
+    return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost'
+  } catch {
+    return true
+  }
+}
+
+/**
+ * Dial one endpoint. Resolves with whether the socket opened; never rejects.
+ * @returns {Promise<{ opened: boolean, reason: string }>}
+ */
+async function dial(endpoint, settings) {
+  return new Promise((resolve) => {
+    let settled = false
+    let opened = false
+    const finish = (reason) => {
+      if (settled) return
+      settled = true
+      resolve({ opened, reason })
+    }
+    // A dial to a closed port can stall without ever firing open or error when
+    // the OS is slow to refuse it. Without this guard the single-flight
+    // promise never settles, and every later connect() call returns that same
+    // dead promise, leaving the extension permanently offline.
+    const dialTimer = setTimeout(() => {
+      if (!opened) setStatus('error', 'bridge did not answer within 10s; check the url and that DSH is running')
+      try {
+        socket?.close()
+      } catch {
+        /* already gone */
+      }
+      socket = null
+      finish('dial timed out after 10s')
+    }, 10_000)
+    let ws
+    try {
+      ws = new WebSocket(endpoint)
+    } catch (error) {
+      clearTimeout(dialTimer)
+      finish(error instanceof Error ? error.message : String(error))
+      return
+    }
+    socket = ws
+    ws.addEventListener('open', () => {
+      clearTimeout(dialTimer)
+      opened = true
+      backoffMs = 500
+      startPing()
+      ws.send(JSON.stringify({ type: 'hello', version: PROTOCOL_VERSION, browser: browserInfo(), agent: settings.agentLabel }))
+      setStatus('connected', 'bridge open')
+      finish('opened')
+    })
+    ws.addEventListener('message', (event) => {
+      if (typeof event.data !== 'string') return
+      void handleFrame(event.data)
+    })
+    ws.addEventListener('error', () => {
+      clearTimeout(dialTimer)
+      if (ws.readyState !== WebSocket.OPEN) setStatus('error', 'bridge refused the connection; check the URL and token')
+      finish('the socket errored before it opened')
+    })
+    ws.addEventListener('close', (event) => {
+      clearTimeout(dialTimer)
+      stopPing()
+      if (socket === ws) socket = null
+      if (stoppedByUser) {
+        setStatus('idle', 'disconnected by user')
+      } else if (opened) {
+        setStatus('disconnected', `closed (${event.code}) ${event.reason || 'no reason'}`.trim())
+        void scheduleReconnect()
+      }
+      finish(`closed (${event.code}) ${event.reason || 'no reason'}`.trim())
+    })
+  })
+}
+
 async function connect({ manual = false } = {}) {
   if (manual) {
     await setUserStopped(false)
@@ -121,7 +212,7 @@ async function connect({ manual = false } = {}) {
   if (socket && socket.readyState <= WebSocket.OPEN) return
   if (connecting) return connecting
   connecting = (async () => {
-    const settings = await readSettings()
+    let settings = await readSettings()
     if (!settings.autoConnect && !manual) {
       setStatus('idle', 'auto-connect is off')
       return
@@ -134,68 +225,30 @@ async function connect({ manual = false } = {}) {
       return
     }
     setStatus('connecting', endpoint.replace(/token=[^&]+/, 'token=***'))
-    await new Promise((resolve) => {
-      let settled = false
-      const finish = () => {
-        if (!settled) {
-          settled = true
-          resolve()
-        }
-      }
-      // A dial to a closed port can stall without ever firing open or error when
-      // the OS is slow to refuse it. Without this guard the single-flight
-      // promise never settles, and every later connect() call returns that same
-      // dead promise, leaving the extension permanently offline.
-      const dialTimer = setTimeout(() => {
-        setStatus('error', 'bridge did not answer within 10s; check the url and that DSH is running')
-        try {
-          socket?.close()
-        } catch {
-          /* already gone */
-        }
-        socket = null
-        finish()
-      }, 10_000)
-      let ws
-      try {
-        ws = new WebSocket(endpoint)
-      } catch (error) {
-        clearTimeout(dialTimer)
-        setStatus('error', error instanceof Error ? error.message : String(error))
-        finish()
-        return
-      }
-      socket = ws
-      ws.addEventListener('open', () => {
-        clearTimeout(dialTimer)
-        backoffMs = 500
-        startPing()
-        ws.send(JSON.stringify({ type: 'hello', version: PROTOCOL_VERSION, browser: browserInfo(), agent: settings.agentLabel }))
-        setStatus('connected', 'bridge open')
-        finish()
-      })
-      ws.addEventListener('message', (event) => {
-        if (typeof event.data !== 'string') return
-        void handleFrame(event.data)
-      })
-      ws.addEventListener('error', () => {
-        clearTimeout(dialTimer)
-        if (ws.readyState !== WebSocket.OPEN) setStatus('error', 'bridge refused the connection; check the URL and token')
-        finish()
-      })
-      ws.addEventListener('close', (event) => {
-        clearTimeout(dialTimer)
-        stopPing()
-        if (socket === ws) socket = null
-        if (stoppedByUser) {
-          setStatus('idle', 'disconnected by user')
-        } else {
-          setStatus('disconnected', `closed (${event.code}) ${event.reason || 'no reason'}`.trim())
-          void scheduleReconnect()
-        }
-        finish()
-      })
-    })
+    let attempt = await dial(endpoint, settings)
+    if (attempt.opened) return
+    if (!isStaleAddress(settings.bridgeUrl)) {
+      // Nothing opened, so no close event will drive the retry: DSH may simply
+      // not be running yet. Keep the backoff loop alive here.
+      if (!stoppedByUser) void scheduleReconnect()
+      return
+    }
+    // The stored address predates the fixed port and no longer resolves. Move
+    // to the default once, persist it, and say so, so the next reconnect after
+    // a restart lands on the stable port instead of repeating this.
+    settings = await writeSettings({ bridgeUrl: DEFAULTS.bridgeUrl })
+    let retry
+    try {
+      retry = endpointFor(settings)
+    } catch (error) {
+      setStatus('error', error.message)
+      return
+    }
+    setStatus('connecting', `the stored address went stale (${attempt.reason}); trying ${DEFAULTS.bridgeUrl}`)
+    attempt = await dial(retry, settings)
+    if (attempt.opened) {
+      setStatus('connected', 'moved to the fixed bridge port')
+    }
   })().finally(() => {
     connecting = null
   })

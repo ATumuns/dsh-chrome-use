@@ -2,22 +2,29 @@
 
 让 DSH 直接操作**你自己的 Chrome**：读页面、点按钮、填表单、切标签页、抓截图、看控制台和网络请求。
 
-Codex 有一个官方 Chrome 插件；这个项目是给 DeepSeek Harness 的等价物，走的是另一条更省事的路：**不需要 native messaging 宿主、不写注册表、不开第二个端口**。DSH 本来就在本地跑一个 HTTP 服务，插件在那个服务上认领一条 WebSocket upgrade 路径，浏览器扩展主动拨回来，配对令牌握手成功后，通道就通了。
+Codex 有一个官方 Chrome 插件；这个项目是给 DeepSeek Harness 的等价物，走的是另一条更省事的路：**不需要 native messaging 宿主、不写注册表、不装原生可执行文件**。插件在本地回环上占一个固定端口，浏览器扩展主动拨回来，配对令牌握手成功后，通道就通了。
+
+为什么是自己占端口而不是复用 DSH 的 Web 服务：那个端口由 `port: 0` 交给系统分配，每次 DSH 启动都可能换号，扩展里存的地址隔天就失效，重连只能靠用户手工改。固定端口才让「无人值守」成立。代价是多一个监听，但它只讲桥接协议，普通 HTTP 请求拿到 404。
 
 ```
 DSH (host bundle)                         Chrome
 ┌──────────────────────────┐             ┌───────────────────────────┐
-│ ctx.webServer            │  WebSocket  │ MV3 extension             │
-│  /dsh-chrome-use/bridge  │◀────────────│  background.js (service   │
-│  /dsh-chrome-use/state   │  拨出 + token│  worker)                  │
-│  /dsh-chrome-use/settings│◀────────────│                           │
-│                          │  插件页轮询  │      │                    │
-│ lib/tools.js             │             │      ▼                    │
-│  chrome_use_*  ×7        │             │ chrome.debugger (CDP)     │
-│ lib/client.js            │             │ chrome.tabs / scripting   │
+│ lib/listener.js          │  WebSocket  │ MV3 extension             │
+│  127.0.0.1:8971          │◀────────────│  background.js (service   │
+│  /dsh-chrome-use/bridge  │  拨出 + token│  worker)                  │
+│                          │             │                           │
+│ ctx.webServer (退路)      │             │                           │
+│  /dsh-chrome-use/state   │◀────────────│  插件页轮询                │
+│  /dsh-chrome-use/settings│             │      │                    │
+│                          │             │      ▼                    │
+│ lib/tools.js             │             │ chrome.debugger (CDP)     │
+│  chrome_use_*  ×7        │             │ chrome.tabs / scripting   │
+│ lib/client.js            │             │                           │
 │  （插件设置页）           │             │                           │
 └──────────────────────────┘             └───────────────────────────┘
 ```
+
+固定端口被别的进程占住时不会拒绝启动：桥接退回 DSH 的 Web 路由，日志里说明端口被占，`chrome_use_status` 显示的就是那个临时地址。
 
 ## 为什么是 WebSocket 直连
 
@@ -25,7 +32,7 @@ DSH (host bundle)                         Chrome
 | --- | --- |
 | Native messaging 宿主 | 要在 `HKCU\SOFTWARE\Google\Chrome\NativeMessagingHosts` 写注册表、装一个原生可执行文件、维护 manifest 路径 |
 | 扩展自己开 `ws://` 监听 | 扩展不能监听端口；只能有内容脚本往页面里注入 |
-| **认领 DSH 已有的 loopback 升级路径** | 零安装负担，随 DSH 一起起停，令牌可轮换 |
+| **插件占一个固定 loopback 端口** | 多一个监听；换来地址在 DSH 重启后不变，重连无需人工介入 |
 
 配对令牌是唯一的凭据：`chrome_use_status` 把它打印出来，用户粘贴进扩展的选项页。换令牌就等于踢掉所有已连接浏览器。
 
@@ -52,6 +59,7 @@ DSH (host bundle)                         Chrome
 - `action fill`：一次传 `fields: [{ref|selector, text|value, replace?, kind?, submit?}]` 填完整个表单，比逐字段 `type` 少 n 次往返。逐项容错，返回值里每个字段都有自己的 `ok` / 错误。
 - `action handoff`：在页面底部画一条提示栏，等你亲手登录或确认支付，点按钮后模型继续。**不要在需要密码或验证码的地方硬试**——交给这条动作。
 - `action drag`：从 `ref` 拖到 `toRef`，发完整鼠标按下／移动／抬起序列（12 步插值），排序、滑块、拖放上传都能用。
+- `action dialog`：回答挡住页面的 alert／confirm／prompt。接受与否用 `accept`，prompt 的输入用 **`promptText`**（Chrome `Page.handleJavaScriptDialog` 的字段名）。`text` 是 `action type` 的字段，这里传它会被明确拒绝，避免你以为填了答案其实 prompt 是空的。
 
 ### 省钱地读页面
 
@@ -89,8 +97,14 @@ install_bundle  →  D:\文档\deepseek-harness\dsh-chrome-use
 装好后日志里会有两行：
 
 ```
-dsh-chrome-use: bridge listening at ws://127.0.0.1:<port>/dsh-chrome-use/bridge (token generated)
+dsh-chrome-use: bridge listening on ws://127.0.0.1:8971/dsh-chrome-use/bridge
 dsh-chrome-use: load the extension from …\dsh-chrome-use\extension — chrome://extensions → Developer mode → Load unpacked
+```
+
+端口被别的进程占住时第一行会变成警告，并把桥接退回 DSH 的 Web 路由：
+
+```
+dsh-chrome-use: could not claim port 8971 (port 8971 is already taken by another process); the bridge stays on the DSH web server at ws://127.0.0.1:<port>/dsh-chrome-use/bridge, which changes port on restart
 ```
 
 ### 2. 浏览器扩展
@@ -98,7 +112,9 @@ dsh-chrome-use: load the extension from …\dsh-chrome-use\extension — chrome:
 1. 打开 `chrome://extensions`
 2. 右上角打开 **开发者模式**
 3. **加载已解压的扩展程序** → 选 `dsh-chrome-use\extension`
-4. 打开扩展的**选项**页，粘贴 token（从 `chrome_use_status` 拿），确认桥接地址，点连接
+4. 打开扩展的**选项**页，粘贴 token（从 `chrome_use_status` 拿），确认桥接地址是 `ws://127.0.0.1:8971/dsh-chrome-use/bridge`，点连接
+
+从 1.0.2 起扩展默认就指向固定端口。老版本留下的临时地址不用手动改：拨号失败时会自动回退到默认端口并把新地址写回 `chrome.storage`。
 
 Edge 走 `edge://extensions`，步骤一样。
 
@@ -107,6 +123,7 @@ Edge 走 `edge://extensions`，步骤一样。
 装完之后，**设置 → 插件 → 已安装**里找到「DSH Chrome Use」，点开卡片标题，描述与行列表之间就是本插件自己的页面：
 
 - **浏览器连接**：桥接地址、版本、连接状态；配对令牌默认打码，可显示 / 复制 / 轮换；令牌来源（`config` / `file` / `generated`）与落盘路径。
+- **桥接端口**：固定回环端口与绑定地址，改完保存后插件重载，扩展需要同步改选项页里的地址。
 - **运行状态**：每个已连接浏览器的 clientId、标签、浏览器版本、接入时间、在途命令数；能力位与「设置是否已写入 profile」。
 - **功能开关**：`注册工具` / `系统提示词段落` / `只读模式` / `允许 evaluate` 四个总闸，加每个工具一个开关；改动要按「保存开关」才写盘，回到默认值会自动删掉配置行。
 - **功能清单**：七个工具各占一行——工具名、一句功能简述、当前是否可用，以及不可用时是哪一条规则挡住的。
@@ -186,7 +203,8 @@ node scripts/make-icons.mjs       # 从几何描述重建 PNG 图标
 ```
 dsh-chrome-use/
 ├── lib/
-│   ├── index.js      插件入口：认领升级路径、注册工具、注入提示段、挂路由
+│   ├── index.js      插件入口：占端口、认领升级路径、注册工具、注入提示段、挂路由
+│   ├── listener.js   固定回环端口（port 0 的 Web 服务给不了稳定地址）
 │   ├── bridge.js     连接注册表、令牌握手、命令/应答编解码
 │   ├── tools.js      七个工具的定义（纯对象，自校验参数）
 │   ├── validate.js   参数校验（DSH 只校验 output.schema）
@@ -204,7 +222,7 @@ dsh-chrome-use/
 │   ├── popup.*       状态与开关
 │   └── options.*     桥接地址、令牌、标签
 ├── locale/           插件卡片文案
-├── test/             协议层、设置、契约、对话框、动作接缝测试
+├── test/             协议层、监听器、设置、契约、对话框、动作接缝测试
 └── scripts/          图标生成
 ```
 
@@ -219,6 +237,8 @@ dsh-chrome-use/
 - `action timezone` 用的是页面级 shim，不是 CDP 的时区覆盖（`Emulation.setTimezoneOverride` 对扩展客户端返回 `Timezone override is only available to trusted clients`）。它对 `Date` 与 `Intl.DateTimeFormat` 生效，但改不了 `Date.now()` 之外的时间源，也拦不住已经缓存了时区的第三方库。
 - `action windowState` 只在 `focused: true` 时才把 `focused` 字段发给 `chrome.windows.update`——同时传 `focused: false` 和 `state` 会被 Chrome 整个拒绝（`Invalid value for state`）。
 - 队列是**按标签页**串行的。同一个标签页上的命令互相排队（否则对话框、导航、点击会互相踩），不同标签页之间天然并行。
+- 桥接端口是固定的（默认 `8971`），但它只监听回环。想从另一台机器连进来，得同时改 `host` 与扩展的选项页地址——插件不会替你把令牌发到网络上。
+- 同一个固定端口只能有一个占用者：同时开两个 DSH 实例时，后起来的那个会退回 Web 路由并在日志里说明，`chrome_use_status` 显示的地址也随之变化。
 - 跨源 iframe 只报出 `src`，不进去。要操作它就在独立标签页打开——`chrome.debugger` 是按标签页 attach 的，跨源 frame 的坐标系也不属于当前文档。
 - 独立子窗口里的标签页和普通标签页一样受「按标签页串行」约束；窗口本身不抢焦点，但它里面的页面仍然可能弹系统级对话框（下载、权限），这些只能由用户在本机点。
 - `action handoff` 等的是**人**，不是模型：超时（默认 10 分钟）后返回 `resumed: false`，页面上的提示栏会被移除。
