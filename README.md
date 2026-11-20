@@ -184,6 +184,8 @@ node test/settings.test.mjs       # 设置归一化、写盘、拒绝语义、�
 node test/tool-contract.test.mjs  # host 发的方法名与扩展的 case 双向对齐
 node test/dialog.test.mjs         # 看门狗放弃命令、对话框旁路
 node test/actions.test.mjs        # 桩 chrome + 桩 CDP 跑通每个新动作的调用形状
+node test/listener.test.mjs       # 固定端口绑定、端口被占降级、幂等关闭
+node test/migrate.test.mjs        # 老安装的临时地址被改写成固定端口
 node scripts/make-icons.mjs       # 从几何描述重建 PNG 图标
 ```
 

@@ -16,7 +16,8 @@
 - 已经装过扩展的用户不用手动改：拨号失败且存的地址不是默认端口时，会自动回退到固定端口、
   写回 `chrome.storage`，状态栏标明「moved to the fixed bridge port」。
 - 拨号失败但地址已经是默认端口时（DSH 还没起来），会主动排一次退避重连。
-  之前只有 socket 打开过才会有 close 事件驱动重试，冷启动时等于什么都不发生。
+  之前只有 socket 打开过才会有 close 事件驱动重试，冷启动时等于什么都不发生；
+  回退到固定端口之后仍然打不通时同样会排重试，否则那条分支同样会静默停摆。
 
 ### 新增
 
@@ -25,11 +26,12 @@
 - 插件配置新增 `port` / `host` 两项，并能在插件页的「桥接端口」卡片里改；
   `port` 用 Standard Schema 校验（1–65535），因为非法端口的唯一症状是挂载时的一行警告。
 - `test/listener.test.mjs`：绑定、端口被占降级、幂等关闭、关闭后端口可复用，10 项。
+- `test/migrate.test.mjs`：老安装存的临时地址被改写成固定端口、令牌与其余设置原样保留、保活闹钟照常挂上，4 项。
 
 ### 测试
 
-`node _work/run-tests.mjs` → 7 个文件全 PASS（actions 27 / bundle-shape 8 / dialog /
-listener 10 / settings 36 / tool-contract 40 / ws-bridge）。
+`node _work/run-tests.mjs` → 8 个文件全 PASS（actions 27 / bundle-shape 8 / dialog /
+listener 10 / migrate 4 / settings 36 / tool-contract 40 / ws-bridge）。
 
 ## [1.0.1] — 2026-11-19
 
