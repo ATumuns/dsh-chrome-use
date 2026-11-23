@@ -54,6 +54,24 @@ DSH (host bundle)                         Chrome
 
 `chrome_use_tabs action window` 用 `chrome.windows.create({focused: false})` 开一个**新窗口**，它不抢焦点、不打断你正在做的事——模型在里面点击和输入，你的鼠标和键盘仍然归你。`action windowState`（`state` + `focused`）可以最小化、还原或把窗口调到前台；`action closeWindow` 关掉它（只剩一个窗口时拒绝，避免把浏览器关掉）。同一个任务里先用 `action tabs list` 拿到窗口里的 `tabId`，其余工具照常接受 `tabId`。
 
+### 你登录过的网站，子窗口里还是登录状态
+
+打开的窗口属于扩展所在的那个 profile，**和你的标签页共用同一套 cookie 与 localStorage**。所以你在浏览器里登录过的站点，模型新开的子窗口直接就是已登录的，不需要重新登一次、也不需要额外配置。
+
+这条能成立有个前提：扩展装在**你平时在用的那个 Chrome** 里。如果装在另一个 profile（比如自动化专用的一次性 profile），那它当然只能看到那个 profile 的 cookie——这跟「保持登录」本身无关，是两套独立的浏览器数据。
+
+`chrome_use_status` 的 `profile:` 行把这件事说清楚：
+
+```
+profile: 2 window(s); cookies are the ones you are signed in with
+```
+
+无痕窗口是唯一的例外——它用的是独立的空 cookie 罐，在里面开页面必然要重新登录。所以：
+
+- `chrome_use_tabs action list` 会给无痕窗口里的标签标上 `(incognito)`；
+- `chrome_use_tabs action open` / `action window` 的返回里带 `incognito` 字段，报的是**窗口实际的**状态，不是你传的参数（把标签开进一个已存在的窗口时，落点由那个窗口决定）；
+- 扩展默认不允许在无痕窗口里运行，这时传 `incognito: true` 会明确告诉你：要在 `chrome://extensions` 打开「允许无痕」并重新加载扩展，而且无痕窗口的 cookie 罐是空的。
+
 ### 批量与人工接力
 
 - `action fill`：一次传 `fields: [{ref|selector, text|value, replace?, kind?, submit?}]` 填完整个表单，比逐字段 `type` 少 n 次往返。逐项容错，返回值里每个字段都有自己的 `ok` / 错误。
@@ -242,6 +260,7 @@ dsh-chrome-use/
 
 - 只能驱动 Chromium 系（Chrome / Edge / Brave 等）。Firefox 的 `browser.debugger` 协议不同。
 - 一个 DSH 可以连多个浏览器（多台机器、多个 profile），工具参数 `browser` 按 id 或标签选。
+- 登录态跟着 profile 走，不跟着扩展走：子窗口共享你已登录的 cookie，前提是扩展装在你日常用的那个 Chrome 里。装在一次性 profile 里就只能拿到那个 profile 的空 cookie 罐——这不是「登录丢了」，是两个浏览器数据目录。无痕窗口同理，它有自己的空罐。
 - 控制台和网络缓冲是按标签页的环形缓冲，上限 400 / 300 条，读了就清不掉的会覆盖最旧的。
 - PDF 用 `Page.printToPDF`，无头和有头行为在部分站点上不同。
 - `action drag` 的中间移动是**并发发出、不等 ack** 的：按下之后浏览器进程会扣住后续事件的应答直到手势结束，逐条等待必然死锁。代价是 `drag` 只保证按下与抬起被确认，中间轨迹的具体落点由页面决定；发完拖放后建议用快照或 `action markdown` 核对结果。如果一次 drag 中途卡住，按压标志会污染整个浏览器进程（所有标签页的点击都会被静默吞掉），`action reset` 用 `Input.cancelDragging` + 视口中心释放来复位——注意 `(0,0)` 的释放会被 Chrome 判越界而拒绝。

@@ -27,6 +27,20 @@ import {
 
 const DEBUGGER_PAGE = /^(chrome|edge|about|devtools|chrome-extension|view-source):/i
 
+/**
+ * Explain an empty `windows.create` answer.
+ *
+ * Chrome returns null instead of throwing when an extension asks for an
+ * incognito window it is not allowed to open, and reading `.tabs` off that null
+ * surfaced as a TypeError that told the caller nothing.
+ */
+function incognitoRefusal(askedForIncognito) {
+  if (askedForIncognito) {
+    return 'this extension is not allowed in incognito windows, so Chrome refused to open one; turn on "Allow in incognito" on chrome://extensions and reload the extension. Note that an incognito window also has an empty cookie jar, so a page there will not be signed in'
+  }
+  return 'Chrome refused to open a window'
+}
+
 /** Start-up scripts installed per tab, so a stale one can be removed before replacing it. */
 const timezoneIds = new Map()
 
@@ -97,6 +111,12 @@ export async function listTabs(params = {}) {
   if (params.groupId !== undefined) query.groupId = params.groupId
   const tabs = await chrome.tabs.query(query)
   const attached = new Set(attachedTabs())
+  // Which windows are incognito is a property of the window, not the tab, and
+  // it decides whether the tab shares the cookie jar the user is signed into.
+  // Automation that silently lands in an incognito window looks identical to
+  // one that does not — until every site asks for a login.
+  const windows = await chrome.windows.getAll().catch(() => [])
+  const incognito = new Map(windows.map((window) => [window.id, window.incognito === true]))
   const rows = tabs
     .filter((tab) => (params.includeBrowserPages ? true : !DEBUGGER_PAGE.test(tab.url ?? '')))
     .map((tab) => ({
@@ -110,6 +130,7 @@ export async function listTabs(params = {}) {
       title: tab.title,
       url: tab.url,
       attached: attached.has(tab.id),
+      incognito: incognito.get(tab.windowId) === true,
     }))
   return { count: rows.length, tabs: rows }
 }
@@ -124,6 +145,7 @@ export async function openTab(params = {}) {
       focused: params.window === 'new' && params.focused === true,
       ...(params.incognito === true ? { incognito: true } : {}),
     })
+    if (!created) throw new Error(incognitoRefusal(params.incognito === true))
     const tabId = created.tabs?.[0]?.id
     if (params.waitForLoad && typeof tabId === 'number') await waitForTabLoad(tabId, params.timeoutMs ?? 20000)
     const fresh = typeof tabId === 'number' ? await chrome.tabs.get(tabId) : null
@@ -134,6 +156,7 @@ export async function openTab(params = {}) {
       title: fresh?.title ?? '',
       status: fresh?.status ?? 'loading',
       window: params.window,
+      incognito: created.incognito === true,
     }
   }
   const tab = await chrome.tabs.create({
@@ -143,7 +166,19 @@ export async function openTab(params = {}) {
   })
   if (params.waitForLoad) await waitForTabLoad(tab.id, params.timeoutMs ?? 20000)
   const fresh = await chrome.tabs.get(tab.id)
-  return { tabId: fresh.id, windowId: fresh.windowId, url: fresh.url, title: fresh.title, status: fresh.status, window: 'current' }
+  // Report the window's real incognito flag rather than the argument: a tab
+  // opened into an existing window goes wherever that window lives, whatever
+  // was asked for, and the cookie jar follows the window.
+  const window = await chrome.windows.get(fresh.windowId).catch(() => null)
+  return {
+    tabId: fresh.id,
+    windowId: fresh.windowId,
+    url: fresh.url,
+    title: fresh.title,
+    status: fresh.status,
+    window: 'current',
+    incognito: window?.incognito === true,
+  }
 }
 
 /**
@@ -152,6 +187,10 @@ export async function openTab(params = {}) {
  * `focused: false` is what keeps the user's foreground window where it is; the
  * window still exists, is real, and can be driven by CDP, it just never takes
  * the keyboard away. `state: 'minimized'` goes one step further on request.
+ *
+ * The window joins the profile the person is already using, so the pages in it
+ * arrive signed in. That is the point of automating their browser instead of a
+ * fresh one: the session they built by hand is the session the work runs on.
  */
 export async function openWindow(params = {}) {
   const width = Number(params.width ?? 1280)
@@ -164,6 +203,7 @@ export async function openWindow(params = {}) {
     height: Math.max(240, height),
     ...(params.incognito === true ? { incognito: true } : {}),
   })
+  if (!created) throw new Error(incognitoRefusal(params.incognito === true))
   const tabId = created.tabs?.[0]?.id
   if (params.minimized === true) {
     await chrome.windows.update(created.id, { state: 'minimized' })
@@ -177,7 +217,7 @@ export async function openWindow(params = {}) {
     title: fresh?.title ?? '',
     focused: false,
     minimized: params.minimized === true,
-    incognito: params.incognito === true,
+    incognito: created.incognito === true,
   }
 }
 
@@ -1359,6 +1399,28 @@ export function status() {
 }
 
 /**
+ * Report the cookie context automation actually runs in.
+ *
+ * A tab's cookie jar belongs to its window: normal windows share the profile
+ * the user is signed into, incognito windows get an empty jar of their own.
+ * That single fact separates "the page works, the user stays signed in" from
+ * "every site asks for a password again", and it is invisible from a tab row
+ * unless it is reported. Nothing here is inferred — ask the browser.
+ */
+export async function profileInfo() {
+  const windows = await chrome.windows.getAll().catch(() => [])
+  const incognitoWindows = windows.filter((window) => window.incognito === true).length
+  return {
+    windows: windows.length,
+    incognitoWindows,
+    // Tabs opened into a normal window read the profile's jar, so a sign-in the
+    // user did by hand carries into automation. This only stops being true for
+    // incognito windows, which is why they are counted above.
+    sharesUserCookies: windows.length > incognitoWindows,
+  }
+}
+
+/**
  * Dispatch one bridge command.
  * @param {string} method
  * @param {Record<string, unknown>} params
@@ -1366,7 +1428,7 @@ export function status() {
 export async function dispatch(method, params) {
   switch (method) {
     case 'status':
-      return status()
+      return { ...status(), profile: await profileInfo().catch(() => null) }
     case 'tabs.list':
       return listTabs(params)
     case 'tabs.open':

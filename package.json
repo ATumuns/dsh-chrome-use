@@ -1,6 +1,6 @@
 {
   "name": "dsh-chrome-use",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "type": "module",
   "description": "DSH-Chrome-Use: let DeepSeek Harness drive your real Chromium browser (Chrome/Edge) through a paired MV3 extension and the Chrome DevTools Protocol.",

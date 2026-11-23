@@ -2,6 +2,27 @@
 
 按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 组织，版本号遵循语义化版本。
 
+## [1.0.4] — 2026-11-23
+
+登录态这件事原本是对的，但没法看见——现在能看见，出错时也说得清楚。
+
+### 新增
+
+- **`chrome_use_status` 多一行 `profile:`**，说明驱动中的窗口和你的标签页是否共用同一套 cookie：
+  `profile: 2 window(s); cookies are the ones you are signed in with`。全都开着无痕窗口时会变成为
+  「only incognito windows are open, so sites will ask for a login」。
+- **`chrome_use_tabs action list` 给无痕窗口里的标签标上 `(incognito)`**
+  （JSON 里是 `tabs[].incognito`）。哪些窗口是无痕是窗口的属性、不是标签的属性，而它恰好决定了
+  这个标签能不能看到你已登录的站点——不报出来就没法判断。
+- `action open` / `action window` 的返回新增 `incognito` 字段，报的是**窗口实际**状态，
+  不是传进来的参数：把标签开进一个已存在的窗口时，落在哪个 cookie 罐由那个窗口决定。
+
+### 修正
+
+- **无痕窗口开不出来时只抛 `Cannot read properties of null`。** Chrome 在扩展没有被允许进入无痕时
+  不抛错、而是返回 `null`，旧代码直接读 `.tabs` 就得到一个不说明任何事的 TypeError。现在会说清
+  要在 `chrome://extensions` 打开「允许无痕」并重新加载扩展，并提醒无痕窗口的 cookie 罐是空的。
+
 ## [1.0.3] — 2026-11-23
 
 整页截图终于是「整页」，而不只是「网页上现在有什么」。

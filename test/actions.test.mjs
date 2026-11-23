@@ -93,8 +93,12 @@ const sendCommand = async (target, method, params = {}) => {
   return {}
 }
 
-const tab = (id) => ({ id, windowId: 1, url: 'https://example.test/page', title: 'Example', active: true, status: 'complete' })
+// windowId 101 is one of the windows `windows.getAll` reports, so the incognito
+// set below can move this tab between cookie jars just by naming a window.
+const tab = (id) => ({ id, windowId: 101, url: 'https://example.test/page', title: 'Example', active: true, status: 'complete' })
 let windowCount = 2
+/** Windows that use a separate cookie jar; tests move members in and out. */
+const incognitoWindows = new Set()
 const reloaded = { value: false }
 
 Object.defineProperty(globalThis, 'navigator', {
@@ -116,11 +120,11 @@ globalThis.chrome = {
     onUpdated: { addListener: () => {} },
   },
   windows: {
-    create: async (options) => ({ id: 77, tabs: [{ ...tab(11), ...options }] }),
+    create: async (options) => ({ id: 77, incognito: options?.incognito === true, tabs: [{ ...tab(11), ...options }] }),
     update: async (id, patch) => ({ id, ...patch }),
-    getAll: async () => Array.from({ length: windowCount }, (_, index) => ({ id: 100 + index })),
+    getAll: async () => Array.from({ length: windowCount }, (_, index) => ({ id: 100 + index, incognito: incognitoWindows.has(100 + index) })),
     remove: async () => {},
-    get: async (id) => ({ id }),
+    get: async (id) => ({ id, incognito: incognitoWindows.has(id) }),
   },
   tabGroups: { update: async () => {} },
   debugger: {
@@ -243,6 +247,61 @@ try {
 
   const handoff = await run('page.handoff', { message: 'sign in', buttonLabel: 'Done' })
   check('page.handoff reports the resume', handoff.resumed === true, JSON.stringify(handoff))
+
+  // A tab in an incognito window reads a different, empty cookie jar. That is
+  // the one way automation loses the user's sign-ins, and it is invisible in a
+  // tab row unless it is reported.
+  incognitoWindows.add(101)
+  const listed = await run('tabs.list', {})
+  check('tabs.list marks incognito tabs', listed.tabs?.[0]?.incognito === true, JSON.stringify(listed.tabs?.[0]))
+  incognitoWindows.clear()
+  const plain = await run('tabs.list', {})
+  check('tabs.list does not mark ordinary tabs incognito', plain.tabs?.[0]?.incognito === false, JSON.stringify(plain.tabs?.[0]))
+
+  // An incognito argument must be echoed from the window that actually opened,
+  // not from the request: the caller needs to know where the tab landed.
+  const incognitoWindow = await run('tabs.window', { url: 'https://example.test/', incognito: true })
+  check('tabs.window reports the window it actually opened', incognitoWindow.incognito === true, JSON.stringify(incognitoWindow))
+  const plainWindow = await run('tabs.window', { url: 'https://example.test/' })
+  check('tabs.window reports a normal window as normal', plainWindow.incognito === false, JSON.stringify(plainWindow))
+
+  const openInWindow = await run('tabs.open', { url: 'https://example.test/', window: 'new' })
+  check('tabs.open reports the window it landed in', openInWindow.incognito === false, JSON.stringify(openInWindow))
+
+  // Chrome answers null rather than throwing when the extension may not open an
+  // incognito window. Reading `.tabs` off that null used to surface as a bare
+  // TypeError that told the caller nothing.
+  globalThis.chrome.windows.create = async () => null
+  let refusedIncognito = null
+  try {
+    await run('tabs.open', { url: 'https://example.test/', window: 'new', incognito: true })
+  } catch (error) {
+    refusedIncognito = String(error.message)
+  }
+  check('tabs.open explains a refused incognito window', /Allow in incognito/.test(refusedIncognito ?? '') && /empty cookie jar/.test(refusedIncognito ?? ''), String(refusedIncognito))
+  let refusedWindow = null
+  try {
+    await run('tabs.window', { url: 'https://example.test/' })
+  } catch (error) {
+    refusedWindow = String(error.message)
+  }
+  check('tabs.window explains a plain refusal', /refused to open a window/.test(refusedWindow ?? ''), String(refusedWindow))
+  globalThis.chrome.windows.create = async (options) => ({ id: 77, incognito: options?.incognito === true, tabs: [{ ...tab(11), ...options }] })
+
+  // A tab opened into an existing incognito window stays in that jar whatever
+  // the argument said, so the answer has to come from the window.
+  incognitoWindows.add(101)
+  const intoIncognito = await run('tabs.open', { url: 'https://example.test/' })
+  check('tabs.open reports a window it did not choose', intoIncognito.incognito === true, JSON.stringify(intoIncognito))
+  incognitoWindows.clear()
+
+  const withProfile = await run('status', {})
+  check('status reports the cookie context', withProfile.profile?.sharesUserCookies === true, JSON.stringify(withProfile.profile))
+  incognitoWindows.add(100)
+  incognitoWindows.add(101)
+  const allIncognito = await run('status', {})
+  check('status says when only incognito windows are open', allIncognito.profile?.sharesUserCookies === false && allIncognito.profile?.incognitoWindows === 2, JSON.stringify(allIncognito.profile))
+  incognitoWindows.clear()
 
   const reload = await run('session.reload', {})
   check('session.reload asks the worker to reload', reload.reloading === true)
