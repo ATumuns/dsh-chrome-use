@@ -7,7 +7,7 @@
  *
  * @module dsh-chrome-use/extension/lib/actions
  */
-import { sessionFor, existingSession, attachedTabs, detachAll, forgetTab, ABANDONED } from './cdp.js'
+import { sessionFor, existingSession, attachedTabs, detachAll, forgetTab, ABANDONED, DIALOG_WATCHDOG_MS } from './cdp.js'
 import {
   snapshotScript,
   focusScript,
@@ -83,19 +83,12 @@ async function evaluate(tabId, expression, { awaitPromise = false, timeoutMs } =
     },
     { releaseOnDialog: true },
   )
-  if (result === ABANDONED) throw dialogOpenedError(session)
+  if (result === ABANDONED) throw new Error(session.slowMessage('Runtime.evaluate', DIALOG_WATCHDOG_MS))
   if (result?.exceptionDetails) {
     const detail = result.exceptionDetails
     throw new Error(detail.exception?.description ?? detail.text ?? 'page evaluation failed')
   }
   return result?.result?.value
-}
-
-/** Build the error for a command that could not return because a dialog blocked the page. */
-function dialogOpenedError(session) {
-  return new Error(
-    `${session.dialogMessage()}. Answer it with chrome_use_interact action dialog, then continue`,
-  )
 }
 
 function formatRect(rect) {

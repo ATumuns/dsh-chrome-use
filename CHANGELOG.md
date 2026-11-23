@@ -2,6 +2,52 @@
 
 按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 组织，版本号遵循语义化版本。
 
+## [1.0.5] — 2026-11-23
+
+一个 12 秒的看门狗把「慢」判成了「有对话框」，而 `markdown` 的写法让「慢」变得很常见。两个都修了。
+
+### 修正
+
+- **慢页面会被误判成被对话框堵住，而且这个判断不会自愈。** `releaseOnDialog` 的命令超时后，
+  旧代码直接给这个标签页记上一个「扩展 attach 之前就弹出来的对话框」。在 GitHub 这种重页面上
+  `markdown` 超过 12 秒很常见，于是一个正常的标签页被永久锁死：之后连 `read evaluate 1+1` 都被拒，
+  而 `interact action dialog` 又说「没有对话框」——两边互相矛盾，只能关标签页。现在一次超时只是记账，
+  连续两次**并且**这个标签页一次都没答上话来才会认定，认定后给出的信息会把「慢」和「对话框」两条路
+  都说清楚。
+- **`markdown` 的字符统计是 O(n²)。** `push()` 每推一行就 `out.join('\n\n')` 一遍来量长度。
+  3000 行时比累加计数慢 360 倍（360ms vs 1ms）；真实页面动辄几万行，长的直接撞上超时。
+  改成累加 `outChars`，`render()` 的收尾判断也改用同一个计数。
+- **导航中途读页面会崩。** `document.documentElement` 在文档加载完成前是 `null`，
+  `pickRoot()` 里的 `querySelectorAll` 于是抛 `TypeError: Cannot read properties of null`。
+  现在把它当作「还没准备好」，返回一句能照做的提示；`selector` 没命中仍然单独报，两者不混。
+- **`markdown` / `table` / `snapshot` / `evaluate` 的 RPC 超时用错了预算。** 它们没给 `client.call`
+  传 `timeoutMs`，于是落到桥接的默认值 30 秒，而工具本身声明的是 120 秒——声明形同虚设。
+  现在按各自的量级传：`markdown`/`table`/`snapshot` 90 秒，`evaluate` 60 秒。
+
+### 测试
+
+- `test/dialog.test.mjs` 删掉那条「一次超时就记成对话框」的断言——它锁的正是一个错的行为。
+  换成两段：一次超时不定罪、连续两次才定罪；另加一节用慢 `sendCommand` 证明慢页面不会被误报，
+  而且恢复后标签页还能用。10 → 13 项。
+- 新增 `test/page-scripts.test.mjs`（14 项）：直接从生成的页面脚本源码上断言，
+  锁住累加计数（不允许再出现 `out.push(trimmed)` 紧跟 `out.join(`）、导航中途的两句提示、
+  懒加载滚动的停止条件与步数上限、表格的 `maxTables`/`maxRows`。
+- 全套 9 个文件 PASS。
+
+### 实测
+
+真实 Chrome 157（build `2026-11-23.2`），夹具 `_work/fixture/`：
+
+| 页面 | 修复前 | 修复后 |
+|---|---|---|
+| GitHub 仓库页 `read markdown` | 30 秒超时 | 正常返回标题 + 表格 |
+| `stress.html`（5.9 MB / 30000 div）`maxChars:100000` | 超时 | 约 7.6 秒返回 100000 chars |
+| `heavy.html`（485 KB / 3000 div） | 正常 | 正常 |
+| `wide.html`（4.6 MB / 30000 组 link+button）`snapshot maxNodes:2000` | — | `refs: 798 (outline truncated)` |
+
+同一页面上量的 DOM 操作基线：30001 个 div 的 `querySelectorAll` 7ms、`innerText` 92ms、
+`getComputedStyle` 17ms、`getBoundingClientRect` 39ms——瓶颈不在查询，在上面那两条。
+
 ## [1.0.4] — 2026-11-23
 
 登录态这件事原本是对的，但没法看见——现在能看见，出错时也说得清楚。

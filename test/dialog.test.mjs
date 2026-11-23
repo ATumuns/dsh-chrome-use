@@ -125,25 +125,69 @@ check('the answer carried accept=true', state.dialogsAnswered[0]?.accept === tru
 check('the session no longer reports a dialog', session.dialog === null)
 
 // --- 4. Recovery: a dialog that opened before the extension attached ---------
-// No event ever arrives for it, so the queue is released by the watchdog and the
-// session records a synthetic dialog the model can still answer.
-const silent = await sessionFor(8)
-state.paused = true
+// No event ever arrives for it, so the queue is released by the watchdog. One
+// timeout is not proof, though: a big page answers slowly too. Only a tab that
+// has answered nothing and keeps not answering is treated as dialog-blocked.
+//
 // The watchdog timer is unref'd so it never keeps the service worker alive. Node
 // would exit on the pending await instead of waiting for it, so the test holds a
 // referenced timer of its own for the duration.
-const keepAlive = setInterval(() => {}, 500)
-const watchdogStart = Date.now()
-const recovered = await silent.send(
+function keepAlive() {
+  const timer = setInterval(() => {}, 500)
+  return () => clearInterval(timer)
+}
+
+const silent = await sessionFor(8)
+state.paused = true
+let release = keepAlive()
+const firstTry = await silent.send(
   'Runtime.evaluate',
   { expression: 'window.__openDialog()', returnByValue: true },
   { releaseOnDialog: true },
 )
-clearInterval(keepAlive)
-const watchdogElapsed = Date.now() - watchdogStart
-check('a watchdog-abandoned command still resolves', recovered === ABANDONED, `got ${String(recovered)}`)
-check('the watchdog fires inside its window', watchdogElapsed >= 11_000 && watchdogElapsed < 16_000, `${watchdogElapsed}ms`)
-check('a synthetic dialog is recorded so the next call fails fast', silent.dialog !== null, JSON.stringify(silent.dialog))
+release()
+check('a watchdog-abandoned command still resolves', firstTry === ABANDONED, `got ${String(firstTry)}`)
+check('one timeout does not convict the tab of having a dialog', silent.dialog === null, JSON.stringify(silent.dialog))
+
+release = keepAlive()
+const secondTry = await silent.send(
+  'Runtime.evaluate',
+  { expression: 'window.__openDialog()', returnByValue: true },
+  { releaseOnDialog: true },
+)
+release()
+check('the second silent timeout in a row is treated as a dialog', silent.dialog !== null, JSON.stringify(silent.dialog))
+
+// --- 5. A slow page is not a dialog -----------------------------------------
+// The same watchdog fires, but this tab answered normally before, so the page is
+// alive and merely slow. Refusing later commands would wedge it for good: the
+// model would be told to answer a dialog that does not exist, and `action dialog`
+// would answer "no dialog is open", leaving no way out.
+// The stub pauses every tab globally, so un-pause the renderer before attaching:
+// this tab's slowness is driven by `busy` alone.
+state.paused = false
+const slow = await sessionFor(9)
+let busy = false
+const normalSend = globalThis.chrome.debugger.sendCommand
+globalThis.chrome.debugger.sendCommand = async (target, method, params) => {
+  if (busy) return new Promise(() => {})
+  return normalSend(target, method, params)
+}
+await slow.send('Runtime.evaluate', { expression: '1 + 1', returnByValue: true })
+busy = true
+let abandonRelease = keepAlive()
+const slowAnswer = await slow.send(
+  'Runtime.evaluate',
+  { expression: '1 + 1', returnByValue: true },
+  { releaseOnDialog: true },
+)
+abandonRelease()
+check('a slow page abandons the command instead of hanging', slowAnswer === ABANDONED, `got ${String(slowAnswer)}`)
+check('a slow page is not reported as a dialog', slow.dialog === null, JSON.stringify(slow.dialog))
+busy = false
+globalThis.chrome.debugger.sendCommand = normalSend
+const afterSlow = await slow.send('Runtime.evaluate', { expression: '2 + 2', returnByValue: true })
+check('the tab works again once it catches up', afterSlow !== undefined, String(afterSlow))
 
 process.stdout.write(`\n${checks - failures}/${checks} checks passed\n`)
 if (failures > 0) {

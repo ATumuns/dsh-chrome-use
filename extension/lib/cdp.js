@@ -23,6 +23,8 @@ const NETWORK_LIMIT = 300
  */
 const DIALOG_WATCHDOG_MS = 12_000
 
+export { DIALOG_WATCHDOG_MS }
+
 /** @type {Map<number, CdpSession>} */
 const sessions = new Map()
 
@@ -84,6 +86,15 @@ export class CdpSession {
     this.events = []
     /** A JavaScript dialog blocks the page until it is answered. */
     this.dialog = null
+    /**
+     * Consecutive commands the watchdog abandoned with no dialog event.
+     *
+     * A slow page and a dialog opened before attach look alike; one timeout is
+     * not enough to tell them apart, so this only counts, it never blocks.
+     */
+    this.abandoned = 0
+    /** Commands that completed normally since attach; see the watchdog in `send`. */
+    this.completedCommands = 0
     /** Queue release for the command that opened `dialog`, if it asked for one. */
     this.dialogRelease = null
     /** Requests sent but not yet finished, used for network-idle waits. */
@@ -129,13 +140,27 @@ export class CdpSession {
         { watchdogMs: options.releaseOnDialog ? DIALOG_WATCHDOG_MS : 0 },
       )
       .then((value) => {
-        // The watchdog fired without an opening event, which means the dialog was
-        // already up before this extension attached. Record it so the next command
-        // fails fast instead of blocking again for the whole watchdog window.
-        if (value === ABANDONED && !this.dialog) {
+        if (value !== ABANDONED) {
+          this.completedCommands += 1
+          this.abandoned = 0
+          return value
+        }
+        // The watchdog fired and no opening event arrived. Two causes look
+        // identical from here: a dialog that was already up before this
+        // extension attached (its event went to nobody), or a page that is
+        // merely slow — a big document, a busy main thread, a heavy `markdown`.
+        //
+        // Guessing "dialog" is the wrong default. A slow read on a large page
+        // would wedge the tab permanently: every later command refuses, and
+        // `action dialog` correctly says no dialog is open, so nothing can clear
+        // it. Suspect a dialog only when the page has answered nothing at all
+        // and keeps not answering — that is what a paused renderer looks like,
+        // and one slow command is not enough to convict it.
+        this.abandoned += 1
+        if (this.abandoned >= 2 && this.completedCommands === 0 && !this.dialog) {
           this.dialog = {
             type: 'javascript dialog',
-            message: 'opened before this extension attached, so its event was never delivered',
+            message: `${this.abandoned} commands in a row timed out with nothing answered on this tab, which is what a dialog opened before the extension attached looks like`,
           }
         }
         return value
@@ -168,6 +193,19 @@ export class CdpSession {
       return `tab ${this.tabId} is not answering commands: a javascript dialog opened before this extension reattached, so its event was never seen. Call chrome_use_interact action dialog (accept true or false, promptText for a prompt) to clear it`
     }
     return `tab ${this.tabId} is blocked by ${dialog.type} "${dialog.message}"; call chrome_use_interact action dialog (accept true or false, promptText for a prompt) before any other command`
+  }
+
+  /**
+   * Explain a command the watchdog gave up on.
+   *
+   * The page may be paused by a dialog, or it may just be slow — a large
+   * document, a busy main thread. Saying "dialog" when nothing was observed
+   * sends the model to answer a dialog that does not exist, so name the
+   * uncertainty and the one way to settle it.
+   */
+  slowMessage(method, ms) {
+    if (this.dialog) return this.dialogMessage()
+    return `tab ${this.tabId} did not answer ${method} within ${ms}ms. That is either a slow page — a large document or a busy main thread — or a javascript dialog that was already open before the extension attached and so was never announced. Retry once; if it times out again, check chrome_use_interact action pendingDialog, and only then try action dialog`
   }
 
   /** Attach and enable the domains whose events we buffer. */

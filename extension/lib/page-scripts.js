@@ -156,7 +156,11 @@ export function snapshotScript(options) {
   ${CORE}
   const OPT = ${JSON.stringify(options)};
   const root = OPT.selector ? document.querySelector(OPT.selector) : (document.body || document.documentElement);
-  if (!root) return { ok: false, error: 'selector matched nothing: ' + OPT.selector };
+  if (!root) {
+    return { ok: false, error: OPT.selector
+      ? 'selector matched nothing: ' + OPT.selector
+      : 'the page is still navigating and has no body yet; wait for it and snapshot again' };
+  }
   // Refs describe the latest snapshot only: a scoped snapshot restarts at e1, so
   // stale attributes from an earlier walk would win document order.
   for (const stale of document.querySelectorAll('[data-dsh-ref]')) stale.removeAttribute('data-dsh-ref');
@@ -295,6 +299,9 @@ export function markdownScript({ selector = null, maxChars = 20_000 } = {}) {
   }
   function pickRoot() {
     if (OPT.selector) return document.querySelector(OPT.selector);
+    // Mid-navigation there is a document but no root element yet, so anything
+    // that queries it throws. That is a "not ready", not a crash.
+    if (!document.documentElement) return null;
     const candidates = [...document.querySelectorAll('article, main, [role="main"], .article, .post, .content, #content, .markdown-body')];
     let best = null;
     let bestScore = 0;
@@ -338,7 +345,7 @@ export function markdownScript({ selector = null, maxChars = 20_000 } = {}) {
   }
 
   function render(el, depth) {
-    if (out.length > OPT.maxChars) { truncated = true; return; }
+    if (outChars > OPT.maxChars) { truncated = true; return; }
     if (!el || !el.tagName) return;
     if (SKIP.has(el.tagName)) return;
     if (el.hasAttribute && el.getAttribute('aria-hidden') === 'true') return;
@@ -388,16 +395,26 @@ export function markdownScript({ selector = null, maxChars = 20_000 } = {}) {
   }
 
   const out = [];
+  let outChars = 0;
   let truncated = false;
+  // Keep a running character count. Rebuilding the whole string here to measure
+  // it makes the whole walk quadratic, which is invisible on a small page and
+  // fatal on a real one: a few tens of thousands of lines then takes long enough
+  // that the caller's timeout fires and the read fails outright.
   function push(line) {
     const trimmed = (line || '').trim();
     if (!trimmed) return;
     out.push(trimmed);
-    if (out.join('\\n\\n').length > OPT.maxChars) truncated = true;
+    outChars += trimmed.length + 2;
+    if (outChars > OPT.maxChars) truncated = true;
   }
 
   const root = pickRoot();
-  if (!root) return { ok: false, error: 'page has no readable body yet' };
+  if (!root) {
+    return { ok: false, error: OPT.selector
+      ? 'selector matched nothing: ' + OPT.selector
+      : 'the page is still navigating and has no body yet; wait for it and read again' };
+  }
   render(root, 0);
   let markdown = out.join('\\n\\n');
   if (markdown.length > OPT.maxChars) { markdown = markdown.slice(0, OPT.maxChars); truncated = true; }
