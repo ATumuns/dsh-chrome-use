@@ -182,6 +182,27 @@ check(
   JSON.stringify(sentCalls.at(-1)?.params),
 )
 
+// The options page tells the user which tool to run; it drifted once already
+// (it named eight tools that never existed and a retired fixed port), and a
+// wrong instruction there is invisible until someone is already stuck.
+const optionsHtml = await readFile(join(root, 'extension', 'options.html'), 'utf8')
+const namedTools = [...new Set(optionsHtml.match(/chrome_use_[a-z_]+/g) ?? [])]
+const toolNames = definitions.map((definition) => definition.name)
+check('the options page names at least one tool', namedTools.length > 0, namedTools.join(', '))
+check(
+  'every tool the options page names actually exists',
+  namedTools.every((name) => toolNames.includes(name)),
+  `not defined: ${namedTools.filter((name) => !toolNames.includes(name)).join(', ')}`,
+)
+// 1.0.2 moved the bridge to a fixed port; the page kept advertising the
+// pre-1.0.2 one that only ever answered on the DSH web server.
+const { SETTINGS_DEFAULTS } = await import('../lib/settings.js')
+check(
+  'the options page advertises the port the bridge really listens on',
+  optionsHtml.includes(`127.0.0.1:${SETTINGS_DEFAULTS.port}/dsh-chrome-use/bridge`),
+  `expected 127.0.0.1:${SETTINGS_DEFAULTS.port}; page says ${/ws:\/\/[^<\s]+/.exec(optionsHtml)?.[0] ?? 'nothing'}`,
+)
+
 process.stdout.write(`\n${checks - failures}/${checks} checks passed\n`)
 if (failures > 0) process.exitCode = 1
 else process.stdout.write('tool-contract: all checks passed\n')

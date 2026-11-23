@@ -86,7 +86,7 @@
         <label>
           <span class="label">桥接地址</span>
           <input id="bridgeUrl" type="text" spellcheck="false" />
-          <p class="note">DSH 默认 <code>ws://127.0.0.1:57232/dsh-chrome-use/bridge</code>；端口随 DSH 实例变化，以 <code>chrome_use_status</code> 输出的为准。</p>
+          <p class="note">DSH 默认 <code>ws://127.0.0.1:8971/dsh-chrome-use/bridge</code>；地址固定，以 <code>chrome_use_status</code> 输出的 <code>bridge</code> 为准。</p>
         </label>
         <label>
           <span class="label">配对令牌</span>
@@ -94,7 +94,7 @@
             <input id="token" type="password" spellcheck="false" autocomplete="off" />
             <button id="reveal" type="button">显示</button>
           </div>
-          <p class="note">在 DSH 里运行工具 <code>chrome_use_status</code>（或 <code>chrome_use_pair</code>），复制返回的 token 粘到这里。</p>
+          <p class="note">在 DSH 里运行工具 <code>chrome_use_status</code>，复制返回的 <code>token</code> 粘到这里。</p>
         </label>
         <label>
           <span class="label">标识（可选）</span>
@@ -115,10 +115,10 @@
         <h2>使用步骤</h2>
         <ol>
           <li>在 DSH 里确认扩展已配对：调用 <code>chrome_use_status</code>，<code>connected: true</code> 即通。</li>
-          <li>让 DSH 打开页面：<code>chrome_use_open_tab</code> 或直接 <code>chrome_use_navigate</code>。</li>
+          <li>让 DSH 打开页面：<code>chrome_use_tabs</code> 传 <code>url</code> 开新标签，或 <code>chrome_use_navigate</code> 在当前标签跳转。</li>
           <li>取快照看页面结构：<code>chrome_use_snapshot</code> 返回可交互元素的 <code>ref</code>（如 <code>e12</code>）与文本大纲。</li>
-          <li>用 <code>ref</code> 操作：<code>chrome_use_click</code> / <code>chrome_use_type</code> / <code>chrome_use_press</code>，无需坐标。</li>
-          <li>排错时看 <code>chrome_use_console</code> 与 <code>chrome_use_network</code>，截图用 <code>chrome_use_screenshot</code>。</li>
+          <li>用 <code>ref</code> 操作：<code>chrome_use_interact</code> 的 <code>click</code> / <code>type</code> / <code>press</code> / <code>fill</code>，无需坐标。</li>
+          <li>排错时用 <code>chrome_use_read</code> 看 <code>console</code> 与 <code>network</code>，截图用 <code>chrome_use_capture</code>。</li>
         </ol>
       </section>
 

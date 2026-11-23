@@ -48,7 +48,7 @@ DSH (host bundle)                         Chrome
 | `chrome_use_snapshot` | 把页面读成带 `ref` 的大纲（可只要可交互元素、可附带截图） |
 | `chrome_use_interact` | `click` `hover` `type` `press` `select` `scroll` `focus` `wait` `drag` `fill` `upload` `dialog` `waitIdle` `handoff` `viewport` `media` `network` `geolocation` `timezone` |
 | `chrome_use_read` | `evaluate` / `console` / `network` / `responseBody` / `storage` / `cookies` / `dialog` / `markdown` / `table` / `metrics` |
-| `chrome_use_capture` | `screenshot`（整页 / 视口 / 单个元素） / `pdf` / `download` |
+| `chrome_use_capture` | `screenshot`（整页含懒加载预热 / 视口 / 单个元素） / `pdf` / `download` |
 
 ### 无人值守：独立子窗口
 
@@ -66,7 +66,16 @@ DSH (host bundle)                         Chrome
 - `action markdown`：把正文转成 markdown（readability-lite：先按文字密度挑主容器，再渲染标题／段落／列表／代码块／表格）。只想要文字时它比快照便宜得多。
 - `action table`：把页面里的表格直接读成「表头 + 行」，最多 8 张表、每张 200 行。
 - `action metrics`：DOM 节点数、JS 堆、layout／recalc 次数、脚本与任务耗时、CLS。排查「为什么这页卡」时先看它。
-- `chrome_use_capture` 传 `ref` 或 `selector` 只截那一个元素，整页截图在长页上会糊到看不清。
+- `chrome_use_capture` 传 `ref` 或 `selector` 只截那一个元素。整页截图在长页上会糊到看不清——这是分辨率的物理限制，不是实现问题，要细节就按元素截。
+
+### 整页截图会先滚动一遍
+
+`fullPage: true` **先把整页滚到底再拍**：`captureBeyondViewport` 只渲染文档、不滚动，所以带 `IntersectionObserver` 的图片、「滚动到底再加载」的列表在单次截图里全是空白。滚动整段在页内一次执行完（不是每步一次往返），到底后还会再等一拍确认没有新增才停——无限列表的 sentinel 通常在触底那一刻才追加内容，滚到底就收工会漏掉最后一批。
+
+- `lazy: false` 关掉预热，要的就是「用户第一眼看到的样子」时用它。
+- `settleMs`（默认 120）每步之后等多久，慢图调高。
+- `maxSteps`（默认 60）步数上限。真滚不完会在输出里写明 `stopped before the bottom (raise maxSteps)`，不会静默截半张。
+- 拍完把你送回原来的滚动位置——包括原本就在顶部的情况。这一趟滚动是模型干的，不是用户干的，留个页面在底部就是可见的 bug。
 
 ### 设备与网络模拟
 

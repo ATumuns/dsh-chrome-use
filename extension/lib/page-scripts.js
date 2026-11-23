@@ -571,6 +571,80 @@ export function storageClearScript(area, keys) {
 })()`
 }
 
+/**
+ * Scroll the document to its bottom so lazy content exists in the DOM.
+ *
+ * A full-page capture renders the document without ever scrolling it, so
+ * everything a site loads on scroll — `loading="lazy"` images,
+ * `IntersectionObserver` batches, infinite-scroll pages — is missing from the
+ * image even though the page looks complete in a browser. This walks a real
+ * viewport down the page one screen at a time and pauses after each step, which
+ * is what those loaders actually watch.
+ *
+ * The whole pass runs as one page promise: a round trip per step would cost more
+ * than the capture. `startScrollTop` lets the caller put the reader back where
+ * they were.
+ *
+ * @param {{ settleMs?: number, maxSteps?: number }} [options]
+ * @returns {string} IIFE source resolving to a pass report.
+ */
+export function lazyScrollScript({ settleMs = 120, maxSteps = 60 } = {}) {
+  return `(() => new Promise((resolve) => {
+  const settle = (ms) => new Promise((done) => setTimeout(done, ms));
+  const read = () => {
+    const doc = document.documentElement;
+    const body = document.body;
+    return {
+      scrollHeight: Math.max(doc ? doc.scrollHeight : 0, body ? body.scrollHeight : 0),
+      viewport: window.innerHeight || (doc ? doc.clientHeight : 0) || 0,
+      scrollTop: Math.round(window.scrollY || (doc ? doc.scrollTop : 0) || 0),
+    };
+  };
+  const start = read();
+  const startScrollTop = start.scrollTop;
+  if (!(start.viewport > 0) || !(start.scrollHeight > 0)) {
+    return resolve({ ok: true, steps: 0, grew: false, atBottom: true, ...start, startScrollTop });
+  }
+  const stride = Math.max(200, Math.floor(start.viewport * 0.9));
+  let height = start.scrollHeight;
+  let offset = 0;
+  let steps = 0;
+  const finish = (atBottom) => resolve({
+    ok: true,
+    steps,
+    grew: height > start.scrollHeight,
+    scrollHeight: height,
+    viewport: start.viewport,
+    startScrollTop,
+    atBottom: atBottom === true,
+  });
+  const step = async () => {
+    if (steps >= ${Number(maxSteps)}) return finish(false);
+    const top = Math.min(offset, Math.max(0, height - start.viewport));
+    window.scrollTo(0, top);
+    steps += 1;
+    await settle(${Number(settleMs)});
+    const now = read();
+    const grew = now.scrollHeight > height;
+    if (grew) height = now.scrollHeight;
+    // The bottom alone is not the end: an infinite-scroll page answers the
+    // sentinel with another batch, so stop only once a settle added nothing.
+    if (top + start.viewport >= height - 2 && !grew) return finish(true);
+    offset = top + stride;
+    return step();
+  };
+  step();
+}))()`
+}
+
+/** Put the document back at one offset; used after a lazy scroll pass. */
+export function restoreScrollScript(scrollTop) {
+  return `(() => {
+  window.scrollTo(0, ${Math.max(0, Math.floor(Number(scrollTop) || 0))});
+  return { ok: true, scrollTop: Math.round(window.scrollY || document.documentElement.scrollTop || 0) };
+})()`
+}
+
 /** Poll for a page condition; resolves with `{ok, matched, waitedMs}`. */
 export function waitScript({ kind, value, timeoutMs, pollMs }) {
   const probe =

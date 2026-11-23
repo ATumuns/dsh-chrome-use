@@ -42,14 +42,36 @@ const ANY_EVALUATE = {
   focused: true,
   dialog: null,
   value: 'v',
+  // The full-page capture path reads this report to decide whether to restore
+  // the reader's scroll position.
+  steps: 3,
+  scrollHeight: 3000,
+  viewport: 800,
+  startScrollTop: 240,
+  grew: true,
+  atBottom: true,
 }
 
 const sent = []
+/** The scroll pass report the page hands back; tests move it to model the reader's position. */
+const lazyReport = { startScrollTop: 240 }
 const sendCommand = async (target, method, params = {}) => {
   sent.push({ tabId: target?.tabId ?? null, method, params })
-  if (method === 'Runtime.evaluate') return { result: { value: ANY_EVALUATE } }
+  if (method === 'Runtime.evaluate') {
+    // The restore expression carries the offset it is putting back; everything
+    // else is the generic page answer, with the scroll pass report overlaid.
+    const restore = /scrollTo\(0, (\d+)\)/.exec(params.expression ?? '')
+    if (restore) return { result: { value: { ok: true, scrollTop: Number(restore[1]) } } }
+    if ((params.expression ?? '').includes('startScrollTop')) {
+      return { result: { value: { ...ANY_EVALUATE, startScrollTop: lazyReport.startScrollTop } } }
+    }
+    return { result: { value: ANY_EVALUATE } }
+  }
   if (method === 'Page.getLayoutMetrics') {
-    return { cssLayoutViewport: { pageX: 12, pageY: 34, clientWidth: 1000, clientHeight: 800 } }
+    return {
+      cssLayoutViewport: { pageX: 12, pageY: 34, clientWidth: 1000, clientHeight: 800 },
+      cssContentSize: { width: 1000, height: 3000 },
+    }
   }
   if (method === 'Page.captureScreenshot') return { data: 'AAAA' }
   if (method === 'Performance.getMetrics') {
@@ -194,6 +216,30 @@ try {
   check('page.screenshot clips one element', clipParams?.clip?.width === 40 && clipParams?.clip?.height === 20, JSON.stringify(clipParams?.clip))
   check('page.screenshot offsets by the page scroll', clipParams?.clip?.x === 12 + 100 - 20 && clipParams?.clip?.y === 34 + 120 - 10, JSON.stringify(clipParams?.clip))
   check('page.screenshot returns base64', typeof shot.base64 === 'string' && shot.width === 40, JSON.stringify({ base64: typeof shot.base64, width: shot.width }))
+
+  // A full-page capture renders the document without scrolling it, so lazy
+  // content has to be woken by an explicit scroll pass first.
+  const full = await run('page.screenshot', { fullPage: true })
+  const fullEvals = sent.filter((entry) => entry.method === 'Runtime.evaluate').map((entry) => entry.params.expression)
+  check('page.screenshot fullPage scrolls to wake lazy content', fullEvals.some((source) => source.includes('scrollTo') && source.includes('scrollHeight')), `${fullEvals.length} evaluate(s)`)
+  check('page.screenshot fullPage reports the scroll pass', full.lazy?.steps === 3 && full.lazy?.grew === true, JSON.stringify(full.lazy))
+  check('page.screenshot fullPage clips to the content size', (() => {
+    const clip = sent.find((entry) => entry.method === 'Page.captureScreenshot')?.params?.clip
+    return clip?.width === 1000 && clip?.height === 3000
+  })(), JSON.stringify(sent.find((entry) => entry.method === 'Page.captureScreenshot')?.params?.clip))
+  check('page.screenshot fullPage restores the reader position', fullEvals.some((source) => source.includes('scrollTo(0, 240)')), fullEvals.at(-1)?.slice(0, 60))
+
+  // Reading from the very top is a position like any other: a capture that
+  // leaves the reader at the page bottom is a visible regression.
+  lazyReport.startScrollTop = 0
+  const fromTop = await run('page.screenshot', { fullPage: true })
+  const fromTopEvals = sent.filter((entry) => entry.method === 'Runtime.evaluate').map((entry) => entry.params.expression)
+  check('page.screenshot fullPage restores a reader who started at the top', fromTop.lazy?.startScrollTop === 0 && fromTopEvals.some((source) => source.includes('scrollTo(0, 0)')), fromTopEvals.at(-1)?.slice(0, 50))
+  lazyReport.startScrollTop = 240
+
+  const noLazy = await run('page.screenshot', { fullPage: true, lazy: false })
+  const noLazyEvals = sent.filter((entry) => entry.method === 'Runtime.evaluate').length
+  check('page.screenshot accepts lazy false', noLazy.lazy === undefined && noLazyEvals === 0, `evaluates=${noLazyEvals}`)
 
   const handoff = await run('page.handoff', { message: 'sign in', buttonLabel: 'Done' })
   check('page.handoff reports the resume', handoff.resumed === true, JSON.stringify(handoff))

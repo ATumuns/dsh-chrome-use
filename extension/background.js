@@ -31,7 +31,7 @@ const MAX_BACKOFF_MS = 30_000
  * only reliable way to tell a freshly reloaded extension from one still running
  * yesterday's code — an automatic reconnect looks identical to a reload.
  */
-const BUILD = '2026-11-20.1'
+const BUILD = '2026-11-23.1'
 
 /** @type {WebSocket | null} */
 let socket = null

@@ -21,6 +21,8 @@ import {
   tableScript,
   handoffScript,
   timezoneScript,
+  lazyScrollScript,
+  restoreScrollScript,
 } from './page-scripts.js'
 
 const DEBUGGER_PAGE = /^(chrome|edge|about|devtools|chrome-extension|view-source):/i
@@ -1022,7 +1024,10 @@ export async function setTimezone(params = {}) {
  *
  * The element path clips `captureBeyondViewport` to the element's box, which is
  * how the model gets a legible picture of a chart or a table without a full-page
- * image it cannot read.
+ * image it cannot read. The full-page path first scrolls the document to its
+ * bottom (see {@link lazyScrollScript}) unless `lazy` is false, because
+ * `captureBeyondViewport` renders the document without scrolling it and every
+ * scroll-triggered loader would stay unloaded.
  */
 export async function screenshot(params = {}) {
   const tab = await resolveTab(params)
@@ -1030,6 +1035,8 @@ export async function screenshot(params = {}) {
   let data
   let width
   let height
+  /** Pass report when a full-page capture scrolled the page first. */
+  let lazy = null
   if (params.ref || params.selector) {
     const box = await evaluate(tab.id, rectScript({ ref: params.ref, selector: params.selector }))
     if (!box?.ok) throw new Error(box?.error ?? 'element not found')
@@ -1053,6 +1060,15 @@ export async function screenshot(params = {}) {
     })
     data = shot.data
   } else if (params.fullPage) {
+    // Lazy content only exists once the page has been scrolled past it, so the
+    // capture is preceded by a real scroll pass unless the caller opts out.
+    if (params.lazy !== false) {
+      lazy = await evaluate(
+        tab.id,
+        lazyScrollScript({ settleMs: params.settleMs ?? 120, maxSteps: params.maxSteps ?? 60 }),
+        { awaitPromise: true },
+      )
+    }
     const metrics = await session.send('Page.getLayoutMetrics')
     const size = metrics.cssContentSize ?? metrics.contentSize
     width = Math.min(Math.ceil(size.width), 8000)
@@ -1064,6 +1080,11 @@ export async function screenshot(params = {}) {
       clip: { x: 0, y: 0, width, height, scale: 1 },
     })
     data = shot.data
+    // Put the reader back where they were, including the very top: the scroll
+    // pass is our doing, not theirs, so "already at 0" is a position to restore
+    // like any other. A capture that left the page at its bottom is a bug the
+    // user sees, not a detail.
+    if (lazy?.ok) await evaluate(tab.id, restoreScrollScript(lazy.startScrollTop ?? 0))
   } else {
     const shot = await session.send('Page.captureScreenshot', {
       format: params.format ?? 'png',
@@ -1079,6 +1100,7 @@ export async function screenshot(params = {}) {
     base64: data,
     fullPage: params.fullPage === true,
     ...(width && height ? { width, height } : {}),
+    ...(lazy ? { lazy } : {}),
   }
 }
 
